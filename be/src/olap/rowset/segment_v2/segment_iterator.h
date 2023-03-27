@@ -114,6 +114,8 @@ public:
     }
 
 private:
+    Status _next_batch_internal(vectorized::Block* block);
+
     template <typename Container>
     bool _update_profile(RuntimeProfile* profile, const Container& predicates,
                          const std::string& title) {
@@ -397,6 +399,8 @@ private:
     // used for compaction, record selectd rowids of current batch
     uint16_t _selected_size;
     vector<uint16_t> _sel_rowid_idx;
+
+    std::unique_ptr<ObjectPool> _pool;
 };
 
 } // namespace segment_v2
