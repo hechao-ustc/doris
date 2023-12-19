@@ -81,6 +81,11 @@ public:
         }
     }
 
+    void set_version(const int version_) override {
+        IAggregateFunctionHelper<Derived>::set_version(version_);
+        nested_function->set_version(version_);
+    }
+
     String get_name() const override {
         /// This is just a wrapper. The function for Nullable arguments is named the same as the nested function itself.
         return nested_function->get_name();
@@ -143,25 +148,17 @@ public:
         }
     }
 
-    void deserialize_and_merge(AggregateDataPtr __restrict place, BufferReadable& buf,
-                               Arena* arena) const override {
+    void deserialize_and_merge(AggregateDataPtr __restrict place, AggregateDataPtr __restrict rhs,
+                               BufferReadable& buf, Arena* arena) const override {
         bool flag = true;
         if (result_is_nullable) {
             read_binary(flag, buf);
         }
         if (flag) {
+            set_flag(rhs);
             set_flag(place);
-            nested_function->deserialize_and_merge(nested_place(place), buf, arena);
-        }
-    }
-
-    void deserialize_and_merge_from_column(AggregateDataPtr __restrict place, const IColumn& column,
-                                           Arena* arena) const override {
-        size_t num_rows = column.size();
-        for (size_t i = 0; i != num_rows; ++i) {
-            VectorBufferReader buffer_reader(
-                    (assert_cast<const ColumnString&>(column)).get_data_at(i));
-            deserialize_and_merge(place, buffer_reader, arena);
+            nested_function->deserialize_and_merge(nested_place(place), nested_place(rhs), buf,
+                                                   arena);
         }
     }
 

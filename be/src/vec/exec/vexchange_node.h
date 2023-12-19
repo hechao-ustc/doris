@@ -56,13 +56,10 @@ public:
     Status get_next(RuntimeState* state, Block* row_batch, bool* eos) override;
     void release_resource(RuntimeState* state) override;
     Status collect_query_statistics(QueryStatistics* statistics) override;
+    Status collect_query_statistics(QueryStatistics* statistics, int sender_id) override;
     Status close(RuntimeState* state) override;
 
-    // Status collect_query_statistics(QueryStatistics* statistics) override;
     void set_num_senders(int num_senders) { _num_senders = num_senders; }
-
-    // final materializtion, used only in topn node
-    Status _second_phase_fetch_data(RuntimeState* state, Block* final_block);
 
 private:
     int _num_senders;
@@ -78,10 +75,6 @@ private:
     VSortExecExprs _vsort_exec_exprs;
     std::vector<bool> _is_asc_order;
     std::vector<bool> _nulls_first;
-
-    // for fetch data by rowids
-    DorisNodesInfo* _nodes_info = nullptr;
-    bool _use_two_phase_read = false;
 };
 } // namespace vectorized
 } // namespace doris

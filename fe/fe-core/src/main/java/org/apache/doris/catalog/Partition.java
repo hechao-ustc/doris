@@ -168,6 +168,18 @@ public class Partition extends MetaObject implements Writable {
         return visibleVersionTime;
     }
 
+    /**
+     * if visibleVersion is 1, do not return creation time but 0
+     *
+     * @return
+     */
+    public long getVisibleVersionTimeIgnoreInit() {
+        if (visibleVersion == 1) {
+            return 0L;
+        }
+        return visibleVersionTime;
+    }
+
     // The method updateVisibleVersionAndVersionHash is called when fe restart, the visibleVersionTime is updated
     private void setVisibleVersion(long visibleVersion) {
         this.visibleVersion = visibleVersion;
@@ -253,17 +265,38 @@ public class Partition extends MetaObject implements Writable {
         return indices;
     }
 
-    public long getDataSize() {
+    public long getAllDataSize(boolean singleReplica) {
+        return getDataSize(singleReplica) + getRemoteDataSize();
+    }
+
+    // this is local data size
+    public long getDataSize(boolean singleReplica) {
         long dataSize = 0;
         for (MaterializedIndex mIndex : getMaterializedIndices(IndexExtState.VISIBLE)) {
-            dataSize += mIndex.getDataSize();
+            dataSize += mIndex.getDataSize(singleReplica);
         }
         return dataSize;
+    }
+
+    public long getRemoteDataSize() {
+        long remoteDataSize = 0;
+        for (MaterializedIndex mIndex : getMaterializedIndices(IndexExtState.VISIBLE)) {
+            remoteDataSize += mIndex.getRemoteDataSize();
+        }
+        return remoteDataSize;
     }
 
     public long getReplicaCount() {
         long replicaCount = 0;
         for (MaterializedIndex mIndex : getMaterializedIndices(IndexExtState.VISIBLE)) {
+            replicaCount += mIndex.getReplicaCount();
+        }
+        return replicaCount;
+    }
+
+    public long getAllReplicaCount() {
+        long replicaCount = 0;
+        for (MaterializedIndex mIndex : getMaterializedIndices(IndexExtState.ALL)) {
             replicaCount += mIndex.getReplicaCount();
         }
         return replicaCount;

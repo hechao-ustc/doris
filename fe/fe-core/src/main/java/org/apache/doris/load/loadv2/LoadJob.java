@@ -77,6 +77,7 @@ import java.io.DataOutput;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -252,6 +253,13 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
         this.label = label;
     }
 
+    public LoadJob(EtlJobType jobType, long dbId, String label, long jobId) {
+        this(jobType);
+        this.id = jobId;
+        this.dbId = dbId;
+        this.label = label;
+    }
+
     protected void readLock() {
         lock.readLock().lock();
     }
@@ -326,10 +334,6 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
         this.loadStatistic.totalFileSizeB = fileSize;
     }
 
-    public TUniqueId getRequestId() {
-        return requestId;
-    }
-
     /**
      * Show table names for frontend
      * If table name could not be found by id, the table id will be used instead.
@@ -390,14 +394,6 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
         return userInfo;
     }
 
-    public void setUserInfo(UserIdentity userInfo) {
-        this.userInfo = userInfo;
-    }
-
-    public String getComment() {
-        return comment;
-    }
-
     public void setComment(String comment) {
         this.comment = comment;
     }
@@ -415,7 +411,9 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
                 timeout = Config.broker_load_default_timeout_second;
                 break;
             case INSERT:
-                timeout = Config.insert_load_default_timeout_second;
+                timeout = Optional.ofNullable(ConnectContext.get())
+                                    .map(ConnectContext::getExecTimeout)
+                                    .orElse(Config.insert_load_default_timeout_second);
                 break;
             case MINI:
                 timeout = Config.stream_load_default_timeout_second;
@@ -427,10 +425,12 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
         jobProperties.put(LoadStmt.EXEC_MEM_LIMIT, 2 * 1024 * 1024 * 1024L);
         jobProperties.put(LoadStmt.MAX_FILTER_RATIO_PROPERTY, 0.0);
         jobProperties.put(LoadStmt.STRICT_MODE, false);
+        jobProperties.put(LoadStmt.PARTIAL_COLUMNS, false);
         jobProperties.put(LoadStmt.TIMEZONE, TimeUtils.DEFAULT_TIME_ZONE);
         jobProperties.put(LoadStmt.LOAD_PARALLELISM, Config.default_load_parallelism);
         jobProperties.put(LoadStmt.SEND_BATCH_PARALLELISM, 1);
         jobProperties.put(LoadStmt.LOAD_TO_SINGLE_TABLET, false);
+        jobProperties.put(LoadStmt.PRIORITY, LoadTask.Priority.NORMAL);
     }
 
     public void isJobTypeRead(boolean jobTypeRead) {
@@ -657,7 +657,7 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
 
         // clean the loadingStatus
         loadingStatus.setState(TEtlState.CANCELLED);
-
+        loadingStatus.setFailMsg(failMsg.getMsg());
         // get load ids of all loading tasks, we will cancel their coordinator process later
         List<TUniqueId> loadIds = Lists.newArrayList();
         for (LoadTask loadTask : idToTasks.values()) {
@@ -760,18 +760,20 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
             jobInfo.add(state.name());
 
             // progress
+            // check null
+            String progress = Env.getCurrentProgressManager().getProgressInfo(String.valueOf(id));
             switch (state) {
                 case PENDING:
-                    jobInfo.add("ETL:0%; LOAD:0%");
+                    jobInfo.add("0%");
                     break;
                 case CANCELLED:
-                    jobInfo.add("ETL:N/A; LOAD:N/A");
+                    jobInfo.add(progress);
                     break;
                 case ETL:
-                    jobInfo.add("ETL:" + progress + "%; LOAD:0%");
+                    jobInfo.add(progress);
                     break;
                 default:
-                    jobInfo.add("ETL:100%; LOAD:" + progress + "%");
+                    jobInfo.add(progress);
                     break;
             }
 
@@ -787,7 +789,7 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
 
             // task info
             jobInfo.add("cluster:" + getResourceName() + "; timeout(s):" + getTimeout()
-                    + "; max_filter_ratio:" + getMaxFilterRatio());
+                    + "; max_filter_ratio:" + getMaxFilterRatio() + "; priority:" + getPriority());
             // error msg
             if (failMsg == null) {
                 jobInfo.add(FeConstants.null_string);
@@ -812,8 +814,12 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
             jobInfo.add(transactionId);
             // error tablets
             jobInfo.add(errorTabletsToJson());
-            // user
-            jobInfo.add(userInfo.getQualifiedUser());
+            // user, some load job may not have user info
+            if (userInfo == null || userInfo.getQualifiedUser() == null) {
+                jobInfo.add(FeConstants.null_string);
+            } else {
+                jobInfo.add(userInfo.getQualifiedUser());
+            }
             // comment
             jobInfo.add(comment);
             return jobInfo;
@@ -830,7 +836,7 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
         return gson.toJson(map);
     }
 
-    protected String getResourceName() {
+    public String getResourceName() {
         return "N/A";
     }
 
@@ -857,8 +863,10 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
             job = new BrokerLoadJob();
         } else if (type == EtlJobType.SPARK) {
             job = new SparkLoadJob();
-        } else if (type == EtlJobType.INSERT) {
+        } else if (type == EtlJobType.INSERT || type == EtlJobType.INSERT_JOB) {
             job = new InsertLoadJob();
+        } else if (type == EtlJobType.MINI) {
+            job = new MiniLoadJob();
         } else {
             throw new IOException("Unknown load type: " + type.name());
         }
@@ -1185,7 +1193,7 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
     }
 
     // unit: second
-    protected long getTimeout() {
+    public long getTimeout() {
         return (long) jobProperties.get(LoadStmt.TIMEOUT_PROPERTY);
     }
 
@@ -1197,7 +1205,7 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
         return (long) jobProperties.get(LoadStmt.EXEC_MEM_LIMIT);
     }
 
-    protected double getMaxFilterRatio() {
+    public double getMaxFilterRatio() {
         return (double) jobProperties.get(LoadStmt.MAX_FILTER_RATIO_PROPERTY);
     }
 
@@ -1207,6 +1215,10 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
 
     protected boolean isStrictMode() {
         return (boolean) jobProperties.get(LoadStmt.STRICT_MODE);
+    }
+
+    protected boolean isPartialUpdate() {
+        return (boolean) jobProperties.get(LoadStmt.PARTIAL_COLUMNS);
     }
 
     protected String getTimeZone() {
@@ -1219,6 +1231,10 @@ public abstract class LoadJob extends AbstractTxnStateChangeCallback implements 
 
     public int getSendBatchParallelism() {
         return (int) jobProperties.get(LoadStmt.SEND_BATCH_PARALLELISM);
+    }
+
+    public LoadTask.Priority getPriority() {
+        return (LoadTask.Priority) jobProperties.get(LoadStmt.PRIORITY);
     }
 
     public boolean isSingleTabletLoadPerSink() {

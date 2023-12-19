@@ -53,20 +53,18 @@ public:
         return arguments[0];
     }
 
-    bool use_default_implementation_for_constants() const override { return true; }
-
     DataTypes get_variadic_argument_types_impl() const override {
         if constexpr (has_variadic_argument) return Impl::get_variadic_argument_types();
         return {};
     }
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) override {
+                        size_t result, size_t input_rows_count) const override {
         const ColumnPtr column = block.get_by_position(arguments[0]).column;
         if (const ColumnString* col = check_and_get_column<ColumnString>(column.get())) {
             auto col_res = ColumnString::create();
-            Impl::vector(col->get_chars(), col->get_offsets(), col_res->get_chars(),
-                         col_res->get_offsets());
+            static_cast<void>(Impl::vector(col->get_chars(), col->get_offsets(),
+                                           col_res->get_chars(), col_res->get_offsets()));
             block.replace_by_position(result, std::move(col_res));
         } else {
             return Status::RuntimeError("Illegal column {} of argument of function {}",

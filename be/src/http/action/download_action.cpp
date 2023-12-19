@@ -25,6 +25,7 @@
 
 #include "common/config.h"
 #include "common/logging.h"
+#include "common/status.h"
 #include "http/http_channel.h"
 #include "http/http_request.h"
 #include "http/utils.h"
@@ -32,14 +33,20 @@
 #include "runtime/exec_env.h"
 
 namespace doris {
+namespace {
+static const std::string FILE_PARAMETER = "file";
+static const std::string TOKEN_PARAMETER = "token";
+static const std::string CHANNEL_PARAMETER = "channel";
+static const std::string CHANNEL_INGEST_BINLOG_TYPE = "ingest_binlog";
+} // namespace
 
-const std::string FILE_PARAMETER = "file";
-const std::string DB_PARAMETER = "db";
-const std::string LABEL_PARAMETER = "label";
-const std::string TOKEN_PARAMETER = "token";
-
-DownloadAction::DownloadAction(ExecEnv* exec_env, const std::vector<std::string>& allow_dirs)
-        : _exec_env(exec_env), _download_type(NORMAL) {
+DownloadAction::DownloadAction(ExecEnv* exec_env,
+                               std::shared_ptr<bufferevent_rate_limit_group> rate_limit_group,
+                               const std::vector<std::string>& allow_dirs, int32_t num_workers)
+        : _exec_env(exec_env),
+          _download_type(NORMAL),
+          _num_workers(num_workers),
+          _rate_limit_group(std::move(rate_limit_group)) {
     for (auto& dir : allow_dirs) {
         std::string p;
         Status st = io::global_local_filesystem()->canonicalize(dir, &p);
@@ -48,11 +55,21 @@ DownloadAction::DownloadAction(ExecEnv* exec_env, const std::vector<std::string>
         }
         _allow_paths.emplace_back(std::move(p));
     }
+    if (_num_workers > 0) {
+        // for single-replica-load
+        static_cast<void>(ThreadPoolBuilder("DownloadThreadPool")
+                                  .set_min_threads(num_workers)
+                                  .set_max_threads(num_workers)
+                                  .build(&_download_workers));
+    }
 }
 
 DownloadAction::DownloadAction(ExecEnv* exec_env, const std::string& error_log_root_dir)
-        : _exec_env(exec_env), _download_type(ERROR_LOG) {
-    io::global_local_filesystem()->canonicalize(error_log_root_dir, &_error_log_root_dir);
+        : _exec_env(exec_env), _download_type(ERROR_LOG), _num_workers(0) {
+#ifndef BE_TEST
+    static_cast<void>(
+            io::global_local_filesystem()->canonicalize(error_log_root_dir, &_error_log_root_dir));
+#endif
 }
 
 void DownloadAction::handle_normal(HttpRequest* req, const std::string& file_param) {
@@ -62,7 +79,7 @@ void DownloadAction::handle_normal(HttpRequest* req, const std::string& file_par
         status = check_token(req);
         if (!status.ok()) {
             std::string error_msg = status.to_string();
-            if (status.is_not_authorized()) {
+            if (status.is<ErrorCode::NOT_AUTHORIZED>()) {
                 HttpChannel::send_reply(req, HttpStatus::UNAUTHORIZED, error_msg);
                 return;
             } else {
@@ -75,10 +92,10 @@ void DownloadAction::handle_normal(HttpRequest* req, const std::string& file_par
     status = check_path_is_allowed(file_param);
     if (!status.ok()) {
         std::string error_msg = status.to_string();
-        if (status.is_not_found() || status.is_io_error()) {
+        if (status.is<ErrorCode::NOT_FOUND>() || status.is<ErrorCode::IO_ERROR>()) {
             HttpChannel::send_reply(req, HttpStatus::NOT_FOUND, error_msg);
             return;
-        } else if (status.is_not_authorized()) {
+        } else if (status.is<ErrorCode::NOT_AUTHORIZED>()) {
             HttpChannel::send_reply(req, HttpStatus::UNAUTHORIZED, error_msg);
             return;
         } else {
@@ -97,7 +114,13 @@ void DownloadAction::handle_normal(HttpRequest* req, const std::string& file_par
     if (is_dir) {
         do_dir_response(file_param, req);
     } else {
-        do_file_response(file_param, req);
+        const auto& channel = req->param(CHANNEL_PARAMETER);
+        bool ingest_binlog = (channel == CHANNEL_INGEST_BINLOG_TYPE);
+        if (ingest_binlog) {
+            do_file_response(file_param, req, _rate_limit_group.get());
+        } else {
+            do_file_response(file_param, req);
+        }
     }
 }
 
@@ -107,7 +130,7 @@ void DownloadAction::handle_error_log(HttpRequest* req, const std::string& file_
     Status status = check_log_path_is_allowed(absolute_path);
     if (!status.ok()) {
         std::string error_msg = status.to_string();
-        if (status.is_not_authorized()) {
+        if (status.is<ErrorCode::NOT_AUTHORIZED>()) {
             HttpChannel::send_reply(req, HttpStatus::UNAUTHORIZED, error_msg);
             return;
         } else {
@@ -120,10 +143,10 @@ void DownloadAction::handle_error_log(HttpRequest* req, const std::string& file_
     status = io::global_local_filesystem()->is_directory(absolute_path, &is_dir);
     if (!status.ok()) {
         std::string error_msg = status.to_string();
-        if (status.is_not_found() || status.is_io_error()) {
+        if (status.is<ErrorCode::NOT_FOUND>() || status.is<ErrorCode::IO_ERROR>()) {
             HttpChannel::send_reply(req, HttpStatus::NOT_FOUND, error_msg);
             return;
-        } else if (status.is_not_authorized()) {
+        } else if (status.is<ErrorCode::NOT_AUTHORIZED>()) {
             HttpChannel::send_reply(req, HttpStatus::UNAUTHORIZED, error_msg);
             return;
         } else {
@@ -141,6 +164,18 @@ void DownloadAction::handle_error_log(HttpRequest* req, const std::string& file_
 }
 
 void DownloadAction::handle(HttpRequest* req) {
+    if (_num_workers > 0) {
+        // async for heavy download job, currently mainly for single-replica-load
+        auto status = _download_workers->submit_func([this, req]() { _handle(req); });
+        if (!status.ok()) {
+            HttpChannel::send_reply(req, HttpStatus::INTERNAL_SERVER_ERROR, status.to_string());
+        }
+    } else {
+        _handle(req);
+    }
+}
+
+void DownloadAction::_handle(HttpRequest* req) {
     VLOG_CRITICAL << "accept one download request " << req->debug_string();
 
     // Get 'file' parameter, then assembly file absolute path

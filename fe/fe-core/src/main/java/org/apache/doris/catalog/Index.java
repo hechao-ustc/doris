@@ -131,6 +131,14 @@ public class Index implements Writable {
         return InvertedIndexUtil.getInvertedIndexParser(properties);
     }
 
+    public String getInvertedIndexParserMode() {
+        return InvertedIndexUtil.getInvertedIndexParserMode(properties);
+    }
+
+    public Map<String, String> getInvertedIndexCharFilter() {
+        return InvertedIndexUtil.getInvertedIndexCharFilter(properties);
+    }
+
     public String getComment() {
         return comment;
     }

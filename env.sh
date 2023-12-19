@@ -61,14 +61,16 @@ CELLARS=(
     wget
     pcre
     maven
-    llvm@15
+    llvm@16
 )
 for cellar in "\${CELLARS[@]}"; do
     EXPORT_CELLARS="\${HOMEBREW_REPO_PREFIX}/opt/\${cellar}/bin:\${EXPORT_CELLARS}"
 done
 export PATH="\${EXPORT_CELLARS}:/usr/bin:\${PATH}"
 
-export DORIS_BUILD_PYTHON_VERSION=python3
+export DORIS_BUILD_PYTHON_VERSION='python3'
+
+export NODE_OPTIONS='--openssl-legacy-provider'
 EOF
 
     DORIS_HOME_ABSOLUATE_PATH="$(
@@ -110,7 +112,7 @@ if [[ -z "${DORIS_TOOLCHAIN}" ]]; then
     if [[ "$(uname -s)" == 'Darwin' ]]; then
         DORIS_TOOLCHAIN=clang
     else
-        DORIS_TOOLCHAIN=gcc
+        DORIS_TOOLCHAIN=clang
     fi
 fi
 
@@ -121,17 +123,12 @@ if [[ "${DORIS_TOOLCHAIN}" == "gcc" ]]; then
         export DORIS_GCC_HOME
     fi
 
-    gcc_ver="$("${DORIS_GCC_HOME}/bin/gcc" -dumpfullversion -dumpversion)"
-    required_ver="7.3.0"
-    if [[ ! "$(printf '%s\n' "${required_ver}" "${gcc_ver}" | sort -V | head -n1)" = "${required_ver}" ]]; then
-        echo "Error: GCC version (${gcc_ver}) must be greater than or equal to ${required_ver}"
-        exit 1
-    fi
     export CC="${DORIS_GCC_HOME}/bin/gcc"
     export CXX="${DORIS_GCC_HOME}/bin/g++"
     if test -x "${DORIS_GCC_HOME}/bin/ld"; then
         export DORIS_BIN_UTILS="${DORIS_GCC_HOME}/bin/"
     fi
+    ENABLE_PCH='OFF'
 elif [[ "${DORIS_TOOLCHAIN}" == "clang" ]]; then
     # set CLANG HOME
     if [[ -z "${DORIS_CLANG_HOME}" ]]; then
@@ -139,12 +136,6 @@ elif [[ "${DORIS_TOOLCHAIN}" == "clang" ]]; then
         export DORIS_CLANG_HOME
     fi
 
-    clang_ver="$("${DORIS_CLANG_HOME}/bin/clang" -dumpfullversion -dumpversion)"
-    required_ver="13.0.0"
-    if [[ ! "$(printf '%s\n' "${required_ver}" "${clang_ver}" | sort -V | head -n1)" = "${required_ver}" ]]; then
-        echo "Error: CLANG version (${clang_ver}) must be greater than or equal to ${required_ver}"
-        exit 1
-    fi
     export CC="${DORIS_CLANG_HOME}/bin/clang"
     export CXX="${DORIS_CLANG_HOME}/bin/clang++"
     if test -x "${DORIS_CLANG_HOME}/bin/ld.lld"; then
@@ -153,9 +144,40 @@ elif [[ "${DORIS_TOOLCHAIN}" == "clang" ]]; then
     if [[ -f "${DORIS_CLANG_HOME}/bin/llvm-symbolizer" ]]; then
         export ASAN_SYMBOLIZER_PATH="${DORIS_CLANG_HOME}/bin/llvm-symbolizer"
     fi
+
+    covs=()
+    while IFS='' read -r line; do covs+=("${line}"); done <<<"$(find "${DORIS_CLANG_HOME}" -name "llvm-cov*")"
+    if [[ ${#covs[@]} -ge 1 ]]; then
+        LLVM_COV="${covs[0]}"
+    else
+        LLVM_COV="$(command -v llvm-cov)"
+    fi
+    export LLVM_COV
+
+    profdatas=()
+    while IFS='' read -r line; do profdatas+=("${line}"); done <<<"$(find "${DORIS_CLANG_HOME}" -name "llvm-profdata*")"
+    if [[ ${#profdatas[@]} -ge 1 ]]; then
+        LLVM_PROFDATA="${profdatas[0]}"
+    else
+        LLVM_PROFDATA="$(command -v llvm-profdata)"
+    fi
+    export LLVM_PROFDATA
+
+    if [[ -z "${ENABLE_PCH}" ]]; then
+        ENABLE_PCH='ON'
+    fi
 else
     echo "Error: unknown DORIS_TOOLCHAIN=${DORIS_TOOLCHAIN}, currently only 'gcc' and 'clang' are supported"
     exit 1
+fi
+
+export CCACHE_COMPILERCHECK=content
+if [[ "${ENABLE_PCH}" == "ON" ]]; then
+    export CCACHE_PCH_EXTSUM=true
+    export CCACHE_SLOPPINESS="pch_defines,time_macros"
+else
+    export CCACHE_NOPCH_EXTSUM=true
+    export CCACHE_SLOPPINESS="default"
 fi
 
 if [[ -z "${DORIS_BIN_UTILS}" ]]; then
@@ -243,12 +265,14 @@ export CMAKE_CMD
 
 GENERATOR="Unix Makefiles"
 BUILD_SYSTEM="make"
-if ninja --version 2>/dev/null; then
+if NINJA_VERSION="$(ninja --version 2>/dev/null)"; then
+    echo "ninja ${NINJA_VERSION}"
     GENERATOR="Ninja"
     BUILD_SYSTEM="ninja"
 fi
 
-if ccache --version >/dev/null; then
+if CCACHE_VERSION="$(ccache --version 2>/dev/null)"; then
+    echo "${CCACHE_VERSION}" | head -n 1
     # shellcheck disable=2034
     CMAKE_USE_CCACHE="-DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
 fi

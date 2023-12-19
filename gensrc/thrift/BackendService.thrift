@@ -35,7 +35,7 @@ struct TTabletStat {
     2: optional i64 data_size
     3: optional i64 row_num
     4: optional i64 version_count
-    5: optional i64 remote_data_size 
+    5: optional i64 remote_data_size
 }
 
 struct TTabletStatResult {
@@ -65,6 +65,8 @@ struct TRoutineLoadTask {
     12: optional TKafkaLoadInfo kafka_load_info
     13: optional PaloInternalService.TExecPlanFragmentParams params
     14: optional PlanNodes.TFileFormatType format
+    15: optional PaloInternalService.TPipelineFragmentParams pipeline_params
+    16: optional bool is_multi_table
 }
 
 struct TKafkaMetaProxyRequest {
@@ -121,6 +123,70 @@ struct TCheckStorageFormatResult {
     2: optional list<i64> v2_tablets;
 }
 
+struct TIngestBinlogRequest {
+    1: optional i64 txn_id;
+    2: optional i64 remote_tablet_id;
+    3: optional i64 binlog_version;
+    4: optional string remote_host;
+    5: optional string remote_port;
+    6: optional i64 partition_id;
+    7: optional i64 local_tablet_id;
+    8: optional Types.TUniqueId load_id;
+}
+
+struct TIngestBinlogResult {
+    1: optional Status.TStatus status;
+    2: optional bool is_async;
+}
+
+struct TQueryIngestBinlogRequest {
+    1: optional i64 txn_id;
+    2: optional i64 partition_id;
+    3: optional i64 tablet_id;
+    4: optional Types.TUniqueId load_id;
+}
+
+enum TIngestBinlogStatus {
+    ANALYSIS_ERROR,
+    UNKNOWN,
+    NOT_FOUND,
+    OK,
+    FAILED,
+    DOING
+}
+
+struct TQueryIngestBinlogResult {
+    1: optional TIngestBinlogStatus status;
+    2: optional string err_msg;
+}
+
+enum TTopicInfoType {
+    WORKLOAD_GROUP
+}
+
+struct TWorkloadGroupInfo {
+  1: optional i64 id
+  2: optional string name
+  3: optional i64 version
+  4: optional i64 cpu_share
+  5: optional i32 cpu_hard_limit
+  6: optional string mem_limit
+  7: optional bool enable_memory_overcommit
+  8: optional bool enable_cpu_hard_limit
+}
+
+struct TopicInfo {
+    1: optional TWorkloadGroupInfo workload_group_info
+}
+
+struct TPublishTopicRequest {
+    1: required map<TTopicInfoType, list<TopicInfo>> topic_map
+}
+
+struct TPublishTopicResult {
+    1: required Status.TStatus status
+}
+
 service BackendService {
     // Called by coord to start asynchronous execution of plan fragment in backend.
     // Returns as soon as all incoming data streams have been set up.
@@ -152,9 +218,9 @@ service BackendService {
     Status.TStatus erase_export_task(1:Types.TUniqueId task_id);
 
     TTabletStatResult get_tablet_stat();
-    
+
     i64 get_trash_used_capacity();
-    
+
     list<TDiskTrashInfo> get_disk_trash_used_capacity();
 
     Status.TStatus submit_routine_load_task(1:list<TRoutineLoadTask> tasks);
@@ -174,4 +240,9 @@ service BackendService {
 
     // check tablet rowset type
     TCheckStorageFormatResult check_storage_format();
+
+    TIngestBinlogResult ingest_binlog(1: TIngestBinlogRequest ingest_binlog_request);
+    TQueryIngestBinlogResult query_ingest_binlog(1: TQueryIngestBinlogRequest query_ingest_binlog_request);
+
+    TPublishTopicResult publish_topic_info(1:TPublishTopicRequest topic_request);
 }

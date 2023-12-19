@@ -20,10 +20,12 @@
 #include <gen_cpp/data.pb.h>
 #include <glog/logging.h>
 
+#include <memory>
+
 namespace doris {
 
 void NodeStatistics::merge(const NodeStatistics& other) {
-    peak_memory_bytes += other.peak_memory_bytes;
+    peak_memory_bytes = std::max(other.peak_memory_bytes, peak_memory_bytes);
 }
 
 void NodeStatistics::to_pb(PNodeStatistics* node_statistics) {
@@ -60,6 +62,15 @@ void QueryStatistics::to_pb(PQueryStatistics* statistics) {
     }
 }
 
+void QueryStatistics::to_thrift(TQueryStatistics* statistics) const {
+    DCHECK(statistics != nullptr);
+    statistics->scan_bytes = scan_bytes;
+    statistics->scan_rows = scan_rows;
+    statistics->cpu_ms = cpu_ms;
+    statistics->returned_rows = returned_rows;
+    statistics->max_peak_memory_bytes = max_peak_memory_bytes;
+}
+
 void QueryStatistics::from_pb(const PQueryStatistics& statistics) {
     scan_rows = statistics.scan_rows();
     scan_bytes = statistics.scan_bytes();
@@ -72,17 +83,25 @@ void QueryStatistics::from_pb(const PQueryStatistics& statistics) {
 }
 
 int64_t QueryStatistics::calculate_max_peak_memory_bytes() {
-    int64_t max_peak_memory_bytes = 0;
+    int64_t max_peak_memory = 0;
     for (auto iter = _nodes_statistics_map.begin(); iter != _nodes_statistics_map.end(); ++iter) {
-        if (max_peak_memory_bytes < iter->second->peak_memory_bytes) {
-            max_peak_memory_bytes = iter->second->peak_memory_bytes;
+        if (max_peak_memory < iter->second->peak_memory_bytes) {
+            max_peak_memory = iter->second->peak_memory_bytes;
         }
     }
-    return max_peak_memory_bytes;
+    return max_peak_memory;
 }
 
 void QueryStatistics::merge(QueryStatisticsRecvr* recvr) {
     recvr->merge(this);
+}
+
+void QueryStatistics::merge(QueryStatisticsRecvr* recvr, int sender_id) {
+    DCHECK(recvr != nullptr);
+    auto QueryStatisticsptr = recvr->find(sender_id);
+    if (QueryStatisticsptr) {
+        merge(*QueryStatisticsptr);
+    }
 }
 
 void QueryStatistics::clearNodeStatistics() {
@@ -97,25 +116,27 @@ QueryStatistics::~QueryStatistics() {
 }
 
 void QueryStatisticsRecvr::insert(const PQueryStatistics& statistics, int sender_id) {
-    std::lock_guard<SpinLock> l(_lock);
-    QueryStatistics* query_statistics = nullptr;
-    auto iter = _query_statistics.find(sender_id);
-    if (iter == _query_statistics.end()) {
-        query_statistics = new QueryStatistics;
-        _query_statistics[sender_id] = query_statistics;
-    } else {
-        query_statistics = iter->second;
+    std::lock_guard<std::mutex> l(_lock);
+    if (!_query_statistics.contains(sender_id)) {
+        _query_statistics[sender_id] = std::make_shared<QueryStatistics>();
     }
-    query_statistics->from_pb(statistics);
+    _query_statistics[sender_id]->from_pb(statistics);
 }
 
-QueryStatisticsRecvr::~QueryStatisticsRecvr() {
-    // It is unnecessary to lock here, because the destructor will be
-    // called alter DataStreamRecvr's close in ExchangeNode.
-    for (auto& pair : _query_statistics) {
-        delete pair.second;
+void QueryStatisticsRecvr::insert(QueryStatisticsPtr statistics, int sender_id) {
+    if (!statistics->collected()) return;
+    if (_query_statistics.contains(sender_id)) return;
+    std::lock_guard<std::mutex> l(_lock);
+    _query_statistics[sender_id] = statistics;
+}
+
+QueryStatisticsPtr QueryStatisticsRecvr::find(int sender_id) {
+    std::lock_guard<std::mutex> l(_lock);
+    auto it = _query_statistics.find(sender_id);
+    if (it != _query_statistics.end()) {
+        return it->second;
     }
-    _query_statistics.clear();
+    return nullptr;
 }
 
 } // namespace doris

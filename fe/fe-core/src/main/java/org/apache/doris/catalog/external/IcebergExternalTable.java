@@ -19,9 +19,12 @@ package org.apache.doris.catalog.external;
 
 import org.apache.doris.catalog.ArrayType;
 import org.apache.doris.catalog.Column;
+import org.apache.doris.catalog.HiveMetaStoreClientHelper;
 import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.datasource.iceberg.IcebergExternalCatalog;
+import org.apache.doris.statistics.ColumnStatistic;
+import org.apache.doris.statistics.util.StatisticsUtil;
 import org.apache.doris.thrift.THiveTable;
 import org.apache.doris.thrift.TIcebergTable;
 import org.apache.doris.thrift.TTableDescriptor;
@@ -33,10 +36,14 @@ import org.apache.iceberg.types.Types;
 
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Optional;
 
 public class IcebergExternalTable extends ExternalTable {
 
-    public static final int ICEBERG_DATETIME_SCALE_MS = 3;
+    // https://iceberg.apache.org/spec/#schemas-and-data-types
+    // All time and timestamp values are stored with microsecond precision
+    public static final int ICEBERG_DATETIME_SCALE_MS = 6;
 
     public IcebergExternalTable(long id, String name, String dbName, IcebergExternalCatalog catalog) {
         super(id, name, catalog, dbName, TableType.ICEBERG_EXTERNAL_TABLE);
@@ -55,15 +62,17 @@ public class IcebergExternalTable extends ExternalTable {
 
     @Override
     public List<Column> initSchema() {
-        Schema schema = ((IcebergExternalCatalog) catalog).getIcebergTable(dbName, name).schema();
-        List<Types.NestedField> columns = schema.columns();
-        List<Column> tmpSchema = Lists.newArrayListWithCapacity(columns.size());
-        for (Types.NestedField field : columns) {
-            tmpSchema.add(new Column(field.name(),
-                    icebergTypeToDorisType(field.type()), true, null, true, field.doc(), true,
-                    schema.caseInsensitiveFindField(field.name()).fieldId()));
-        }
-        return tmpSchema;
+        return HiveMetaStoreClientHelper.ugiDoAs(catalog.getConfiguration(), () -> {
+            Schema schema = ((IcebergExternalCatalog) catalog).getIcebergTable(dbName, name).schema();
+            List<Types.NestedField> columns = schema.columns();
+            List<Column> tmpSchema = Lists.newArrayListWithCapacity(columns.size());
+            for (Types.NestedField field : columns) {
+                tmpSchema.add(new Column(field.name().toLowerCase(Locale.ROOT),
+                        icebergTypeToDorisType(field.type()), true, null, true, field.doc(), true,
+                        schema.caseInsensitiveFindField(field.name()).fieldId()));
+            }
+            return tmpSchema;
+        });
     }
 
     private Type icebergPrimitiveTypeToDorisType(org.apache.iceberg.types.Type.PrimitiveType primitive) {
@@ -131,5 +140,13 @@ public class IcebergExternalTable extends ExternalTable {
             tTableDescriptor.setIcebergTable(icebergTable);
             return tTableDescriptor;
         }
+    }
+
+    @Override
+    public Optional<ColumnStatistic> getColumnStatistic(String colName) {
+        makeSureInitialized();
+        return HiveMetaStoreClientHelper.ugiDoAs(catalog.getConfiguration(),
+                () -> StatisticsUtil.getIcebergColumnStats(colName,
+                        ((IcebergExternalCatalog) catalog).getIcebergTable(dbName, name)));
     }
 }

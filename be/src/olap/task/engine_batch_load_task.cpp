@@ -55,7 +55,6 @@ class TTabletInfo;
 } // namespace doris
 
 using apache::thrift::ThriftDebugString;
-using std::list;
 using std::string;
 using std::vector;
 
@@ -282,7 +281,7 @@ Status EngineBatchLoadTask::_push(const TPushReq& request,
         return Status::InternalError("could not find tablet {}", request.tablet_id);
     }
 
-    PushType type = PUSH_NORMAL_V2;
+    PushType type = PushType::PUSH_NORMAL_V2;
     int64_t duration_ns = 0;
     PushHandler push_handler;
     if (!request.__isset.transaction_id) {
@@ -295,12 +294,12 @@ Status EngineBatchLoadTask::_push(const TPushReq& request,
 
     if (!res.ok()) {
         LOG(WARNING) << "failed to push delta, transaction_id=" << request.transaction_id
-                     << ", tablet=" << tablet->full_name()
+                     << ", tablet=" << tablet->tablet_id()
                      << ", cost=" << PrettyPrinter::print(duration_ns, TUnit::TIME_NS);
         DorisMetrics::instance()->push_requests_fail_total->increment(1);
     } else {
         LOG(INFO) << "succeed to push delta, transaction_id=" << request.transaction_id
-                  << ", tablet=" << tablet->full_name()
+                  << ", tablet=" << tablet->tablet_id()
                   << ", cost=" << PrettyPrinter::print(duration_ns, TUnit::TIME_NS);
         DorisMetrics::instance()->push_requests_success_total->increment(1);
         DorisMetrics::instance()->push_request_duration_us->increment(duration_ns / 1000);
@@ -333,7 +332,7 @@ Status EngineBatchLoadTask::_delete_data(const TPushReq& request,
     if (!request.__isset.transaction_id) {
         return Status::InvalidArgument("transaction_id is not set");
     }
-    res = push_handler.process_streaming_ingestion(tablet, request, PUSH_FOR_DELETE,
+    res = push_handler.process_streaming_ingestion(tablet, request, PushType::PUSH_FOR_DELETE,
                                                    tablet_info_vec);
     if (!res.ok()) {
         DorisMetrics::instance()->delete_requests_failed->increment(1);

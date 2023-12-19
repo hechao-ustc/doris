@@ -42,7 +42,6 @@ import java.util.Map;
  * The new replica can be a rollup replica, or a shadow replica of schema change.
  */
 public class AlterReplicaTask extends AgentTask {
-
     private long baseTabletId;
     private long newReplicaId;
     private int baseSchemaHash;
@@ -129,7 +128,6 @@ public class AlterReplicaTask extends AgentTask {
                 List<SlotRef> slots = Lists.newArrayList();
                 entry.getValue().collect(SlotRef.class, slots);
                 TAlterMaterializedViewParam mvParam = new TAlterMaterializedViewParam(entry.getKey());
-                mvParam.setOriginColumnName(slots.get(0).getColumnName());
                 mvParam.setMvExpr(entry.getValue().treeToThrift());
                 req.addToMaterializedViewParams(mvParam);
             }

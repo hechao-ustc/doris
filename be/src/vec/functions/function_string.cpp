@@ -205,28 +205,46 @@ struct StringInStrImpl {
         res.resize(size);
 
         if (rdata.size == 0) {
-            for (int i = 0; i < size; ++i) {
-                res[i] = 1;
-            }
+            std::fill(res.begin(), res.end(), 1);
             return Status::OK();
         }
+
+        const UInt8* begin = ldata.data();
+        const UInt8* end = begin + ldata.size();
+        const UInt8* pos = begin;
+
+        /// Current index in the array of strings.
+        size_t i = 0;
+        std::fill(res.begin(), res.end(), 0);
 
         StringRef rstr_ref(rdata.data, rdata.size);
         StringSearch search(&rstr_ref);
 
-        for (int i = 0; i < size; ++i) {
-            const char* l_raw_str = reinterpret_cast<const char*>(&ldata[loffsets[i - 1]]);
-            int l_str_size = loffsets[i] - loffsets[i - 1];
-
-            StringRef lstr_ref(l_raw_str, l_str_size);
-
-            // Hive returns positions starting from 1.
-            int loc = search.search(&lstr_ref);
-            if (loc > 0) {
-                size_t len = std::min(lstr_ref.size, (size_t)loc);
-                loc = simd::VStringFunctions::get_char_len(lstr_ref.data, len);
+        while (pos < end) {
+            // search return matched substring start offset
+            pos = (UInt8*)search.search((char*)pos, end - pos);
+            if (pos >= end) {
+                break;
             }
-            res[i] = loc + 1;
+
+            /// Determine which index it refers to.
+            /// begin + value_offsets[i] is the start offset of string at i+1
+            while (begin + loffsets[i] < pos) {
+                ++i;
+            }
+
+            /// We check that the entry does not pass through the boundaries of strings.
+            if (pos + rdata.size <= begin + loffsets[i]) {
+                int loc = pos - begin - loffsets[i - 1];
+                int l_str_size = loffsets[i] - loffsets[i - 1];
+                size_t len = std::min(l_str_size, loc);
+                loc = simd::VStringFunctions::get_char_len((char*)(begin + loffsets[i - 1]), len);
+                res[i] = loc + 1;
+            }
+
+            // move to next string offset
+            pos = begin + loffsets[i];
+            ++i;
         }
 
         return Status::OK();
@@ -478,8 +496,9 @@ struct Trim1Impl {
             auto col_res = ColumnString::create();
             char blank[] = " ";
             StringRef rhs(blank, 1);
-            TrimUtil<is_ltrim, is_rtrim>::vector(col->get_chars(), col->get_offsets(), rhs,
-                                                 col_res->get_chars(), col_res->get_offsets());
+            static_cast<void>(TrimUtil<is_ltrim, is_rtrim>::vector(
+                    col->get_chars(), col->get_offsets(), rhs, col_res->get_chars(),
+                    col_res->get_offsets()));
             block.replace_by_position(result, std::move(col_res));
         } else {
             return Status::RuntimeError("Illegal column {} of argument of function {}",
@@ -511,8 +530,9 @@ struct Trim2Impl {
                 const char* raw_rhs = reinterpret_cast<const char*>(&(col_right->get_chars()[0]));
                 ColumnString::Offset rhs_size = col_right->get_offsets()[0];
                 StringRef rhs(raw_rhs, rhs_size);
-                TrimUtil<is_ltrim, is_rtrim>::vector(col->get_chars(), col->get_offsets(), rhs,
-                                                     col_res->get_chars(), col_res->get_offsets());
+                static_cast<void>(TrimUtil<is_ltrim, is_rtrim>::vector(
+                        col->get_chars(), col->get_offsets(), rhs, col_res->get_chars(),
+                        col_res->get_offsets()));
                 block.replace_by_position(result, std::move(col_res));
             } else {
                 return Status::RuntimeError("Illegal column {} of argument of function {}",
@@ -552,14 +572,12 @@ public:
     // The second parameter of "trim" is a constant.
     ColumnNumbers get_arguments_that_are_always_constant() const override { return {1}; }
 
-    bool use_default_implementation_for_constants() const override { return true; }
-
     DataTypes get_variadic_argument_types_impl() const override {
         return impl::get_variadic_argument_types();
     }
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) override {
+                        size_t result, size_t input_rows_count) const override {
         return impl::execute(context, block, arguments, result, input_rows_count);
     }
 };
@@ -956,7 +974,6 @@ void register_function_string(SimpleFunctionFactory& factory) {
     factory.register_function<FunctionFromBase64>();
     factory.register_function<FunctionSplitPart>();
     factory.register_function<FunctionSplitByString>();
-    factory.register_function<FunctionStringMd5AndSM3<MD5Sum>>();
     factory.register_function<FunctionSubstringIndex>();
     factory.register_function<FunctionExtractURLParameter>();
     factory.register_function<FunctionStringParseUrl>();
@@ -964,7 +981,10 @@ void register_function_string(SimpleFunctionFactory& factory) {
     factory.register_function<FunctionMoneyFormat<MoneyFormatInt64Impl>>();
     factory.register_function<FunctionMoneyFormat<MoneyFormatInt128Impl>>();
     factory.register_function<FunctionMoneyFormat<MoneyFormatDecimalImpl>>();
-    factory.register_function<FunctionStringMd5AndSM3<SM3Sum>>();
+    factory.register_function<FunctionStringDigestOneArg<SM3Sum>>();
+    factory.register_function<FunctionStringDigestOneArg<MD5Sum>>();
+    factory.register_function<FunctionStringDigestSHA1>();
+    factory.register_function<FunctionStringDigestSHA2>();
     factory.register_function<FunctionReplace>();
     factory.register_function<FunctionMask>();
     factory.register_function<FunctionMaskPartial<true>>();
@@ -977,9 +997,10 @@ void register_function_string(SimpleFunctionFactory& factory) {
     factory.register_alias(SubstringUtil::name, "substr");
     factory.register_alias(FunctionToLower::name, "lcase");
     factory.register_alias(FunctionToUpper::name, "ucase");
-    factory.register_alias(FunctionStringMd5AndSM3<MD5Sum>::name, "md5");
+    factory.register_alias(FunctionStringDigestOneArg<MD5Sum>::name, "md5");
     factory.register_alias(FunctionStringUTF8Length::name, "character_length");
-    factory.register_alias(FunctionStringMd5AndSM3<SM3Sum>::name, "sm3");
+    factory.register_alias(FunctionStringDigestOneArg<SM3Sum>::name, "sm3");
+    factory.register_alias(FunctionStringDigestSHA1::name, "sha");
 }
 
 } // namespace doris::vectorized

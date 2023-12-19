@@ -37,7 +37,7 @@ import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.MarkedCountDownLatch;
 import org.apache.doris.common.jmockit.Deencapsulation;
 import org.apache.doris.datasource.InternalCatalog;
-import org.apache.doris.fs.obj.BlobStorage;
+import org.apache.doris.fs.FileSystemFactory;
 import org.apache.doris.persist.EditLog;
 import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.thrift.TStorageMedium;
@@ -111,7 +111,7 @@ public class RestoreJobTest {
 
     @Injectable
     private Repository repo = new Repository(repoId, "repo", false, "bos://my_repo",
-            BlobStorage.create("broker", StorageBackend.StorageType.BROKER, Maps.newHashMap()));
+            FileSystemFactory.get("broker", StorageBackend.StorageType.BROKER, Maps.newHashMap()));
 
     private BackupMeta backupMeta;
 
@@ -153,8 +153,8 @@ public class RestoreJobTest {
 
         new Expectations() {
             {
-                systemInfoService.selectBackendIdsForReplicaCreation((ReplicaAllocation) any,
-                        anyString, (TStorageMedium) any);
+                systemInfoService.selectBackendIdsForReplicaCreation((ReplicaAllocation) any, (TStorageMedium) any,
+                        false, true);
                 minTimes = 0;
                 result = new Delegate() {
                     public synchronized List<Long> selectBackendIdsForReplicaCreation(
@@ -243,7 +243,7 @@ public class RestoreJobTest {
         db.dropTable(expectedRestoreTbl.getName());
 
         job = new RestoreJob(label, "2018-01-01 01:01:01", db.getId(), db.getFullName(), jobInfo, false,
-                new ReplicaAllocation((short) 3), 100000, -1, false, false, env, repo.getId());
+                new ReplicaAllocation((short) 3), 100000, -1, false, false, false, env, repo.getId());
 
         List<Table> tbls = Lists.newArrayList();
         List<Resource> resources = Lists.newArrayList();

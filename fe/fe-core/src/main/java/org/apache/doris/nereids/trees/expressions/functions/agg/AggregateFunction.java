@@ -38,7 +38,6 @@ import java.util.stream.Collectors;
 public abstract class AggregateFunction extends BoundFunction implements ExpectsInputTypes {
 
     protected final boolean distinct;
-    protected boolean isWindowFunction = false;
 
     public AggregateFunction(String name, Expression... arguments) {
         this(name, false, arguments);
@@ -78,12 +77,8 @@ public abstract class AggregateFunction extends BoundFunction implements Expects
         return distinct;
     }
 
-    public boolean isWindowFunction() {
-        return isWindowFunction;
-    }
-
-    public void setWindowFunction(boolean windowFunction) {
-        isWindowFunction = windowFunction;
+    public Class<? extends AggregateFunction> getRollup() {
+        return null;
     }
 
     @Override
@@ -95,8 +90,7 @@ public abstract class AggregateFunction extends BoundFunction implements Expects
             return false;
         }
         AggregateFunction that = (AggregateFunction) o;
-        return isWindowFunction == that.isWindowFunction
-                && Objects.equals(distinct, that.distinct)
+        return Objects.equals(distinct, that.distinct)
                 && Objects.equals(getName(), that.getName())
                 && Objects.equals(children, that.children);
     }

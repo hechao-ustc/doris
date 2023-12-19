@@ -46,7 +46,7 @@ BrokerFileWriter::BrokerFileWriter(ExecEnv* env, const TNetworkAddress& broker_a
 
 BrokerFileWriter::~BrokerFileWriter() {
     if (_opened) {
-        close();
+        static_cast<void>(close());
     }
     CHECK(!_opened || _closed) << "open: " << _opened << ", closed: " << _closed;
 }
@@ -183,7 +183,7 @@ Status BrokerFileWriter::_open() {
 
         try {
             client->openWriter(response, request);
-        } catch (apache::thrift::transport::TTransportException& e) {
+        } catch (apache::thrift::transport::TTransportException&) {
             RETURN_IF_ERROR(client.reopen());
             client->openWriter(response, request);
         }
@@ -237,7 +237,7 @@ Status BrokerFileWriter::_write(const uint8_t* buf, size_t buf_len, size_t* writ
 
         try {
             client->pwrite(response, request);
-        } catch (apache::thrift::transport::TTransportException& e) {
+        } catch (apache::thrift::transport::TTransportException&) {
             RETURN_IF_ERROR(client.reopen());
             // broker server will check write offset, so it is safe to re-try
             client->pwrite(response, request);

@@ -21,9 +21,12 @@ import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.resource.Tag;
+import org.apache.doris.resource.workloadgroup.WorkloadGroupMgr;
 
 import com.google.common.collect.Sets;
 import com.google.gson.annotations.SerializedName;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -34,6 +37,8 @@ import java.util.Set;
  * Used in
  */
 public class CommonUserProperties implements Writable {
+    private static final Logger LOG = LogManager.getLogger(CommonUserProperties.class);
+
     // The max connections allowed for a user on one FE
     @SerializedName("maxConn")
     private long maxConn = 100;
@@ -56,6 +61,9 @@ public class CommonUserProperties implements Writable {
 
     @SerializedName("insertTimeout")
     private int insertTimeout = -1;
+
+    @SerializedName("workloadGroup")
+    private String workloadGroup = WorkloadGroupMgr.DEFAULT_GROUP_NAME;
 
     private String[] sqlBlockRulesSplit = {};
 
@@ -122,6 +130,9 @@ public class CommonUserProperties implements Writable {
     }
 
     public void setQueryTimeout(int timeout) {
+        if (timeout <= 0) {
+            LOG.warn("Setting 0 query timeout", new RuntimeException(""));
+        }
         this.queryTimeout = timeout;
     }
 
@@ -131,6 +142,14 @@ public class CommonUserProperties implements Writable {
 
     public void setInsertTimeout(int insertTimeout) {
         this.insertTimeout = insertTimeout;
+    }
+
+    public String getWorkloadGroup() {
+        return workloadGroup;
+    }
+
+    public void setWorkloadGroup(String workloadGroup) {
+        this.workloadGroup = workloadGroup;
     }
 
     public static CommonUserProperties read(DataInput in) throws IOException {

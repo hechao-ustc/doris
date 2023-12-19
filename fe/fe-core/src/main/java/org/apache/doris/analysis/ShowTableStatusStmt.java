@@ -59,25 +59,25 @@ public class ShowTableStatusStmt extends ShowStmt {
                     .addColumn(new Column("Comment", ScalarType.createVarchar(64)))
                     .build();
 
-    private String db;
     private String catalog;
+    private String db;
     private String wild;
     private Expr where;
     private SelectStmt selectStmt;
 
-    public ShowTableStatusStmt(String db, String catalog, String wild, Expr where) {
+    public ShowTableStatusStmt(String catalog, String db, String wild, Expr where) {
+        this.catalog = catalog;
         this.db = db;
         this.wild = wild;
         this.where = where;
-        this.catalog = catalog;
-    }
-
-    public String getDb() {
-        return db;
     }
 
     public String getCatalog() {
         return catalog;
+    }
+
+    public String getDb() {
+        return db;
     }
 
     public String getPattern() {
@@ -91,8 +91,6 @@ public class ShowTableStatusStmt extends ShowStmt {
             if (Strings.isNullOrEmpty(db)) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DB_ERROR);
             }
-        } else {
-            db = ClusterNamespace.getFullName(analyzer.getClusterName(), db);
         }
         if (Strings.isNullOrEmpty(catalog)) {
             catalog = analyzer.getDefaultCatalog();
@@ -101,7 +99,8 @@ public class ShowTableStatusStmt extends ShowStmt {
             }
         }
 
-        if (!Env.getCurrentEnv().getAccessManager().checkDbPriv(ConnectContext.get(), db, PrivPredicate.SHOW)) {
+        if (!Env.getCurrentEnv().getAccessManager().checkDbPriv(ConnectContext.get(),
+                catalog, db, PrivPredicate.SHOW)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_DBACCESS_DENIED_ERROR, analyzer.getQualifiedUser(), db);
         }
     }

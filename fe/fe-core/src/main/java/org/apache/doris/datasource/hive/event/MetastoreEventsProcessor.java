@@ -22,8 +22,10 @@ import org.apache.doris.catalog.Env;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.util.MasterDaemon;
 import org.apache.doris.datasource.CatalogIf;
+import org.apache.doris.datasource.HMSClientException;
 import org.apache.doris.datasource.HMSExternalCatalog;
 
+import org.apache.hadoop.hive.metastore.api.NoSuchObjectException;
 import org.apache.hadoop.hive.metastore.api.NotificationEvent;
 import org.apache.hadoop.hive.metastore.api.NotificationEventResponse;
 import org.apache.hadoop.hive.metastore.messaging.MessageDeserializer;
@@ -92,6 +94,14 @@ public class MetastoreEventsProcessor extends MasterDaemon {
         for (MetastoreEvent event : events) {
             try {
                 event.process();
+            } catch (HMSClientException hmsClientException) {
+                if (hmsClientException.getCause() != null
+                        && hmsClientException.getCause() instanceof NoSuchObjectException) {
+                    LOG.warn(event.debugString("Failed to process event and skip"), hmsClientException);
+                } else {
+                    hmsExternalCatalog.setLastSyncedEventId(event.getEventId() - 1);
+                    throw hmsClientException;
+                }
             } catch (Exception e) {
                 hmsExternalCatalog.setLastSyncedEventId(event.getEventId() - 1);
                 throw e;
@@ -130,9 +140,8 @@ public class MetastoreEventsProcessor extends MasterDaemon {
             CatalogIf catalog = Env.getCurrentEnv().getCatalogMgr().getCatalog(catalogId);
             if (catalog instanceof HMSExternalCatalog) {
                 HMSExternalCatalog hmsExternalCatalog = (HMSExternalCatalog) catalog;
-                List<NotificationEvent> events = Collections.emptyList();
                 try {
-                    events = getNextHMSEvents(hmsExternalCatalog);
+                    List<NotificationEvent> events = getNextHMSEvents(hmsExternalCatalog);
                     if (!events.isEmpty()) {
                         LOG.info("Events size are {} on catalog [{}]", events.size(),
                                 hmsExternalCatalog.getName());

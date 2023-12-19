@@ -28,13 +28,8 @@ public:
     VLambdaFunctionExpr(const TExprNode& node) : VExpr(node) {}
     ~VLambdaFunctionExpr() override = default;
 
-    doris::Status execute(VExprContext* context, doris::vectorized::Block* block,
-                          int* result_column_id) override {
+    Status execute(VExprContext* context, Block* block, int* result_column_id) override {
         return get_child(0)->execute(context, block, result_column_id);
-    }
-
-    VExpr* clone(doris::ObjectPool* pool) const override {
-        return pool->add(VLambdaFunctionExpr::create_unique(*this).release());
     }
 
     const std::string& expr_name() const override { return _expr_name; }

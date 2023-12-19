@@ -70,16 +70,18 @@ public:
     Status pull(RuntimeState* state, Block* output_block, bool* eos) override;
 
     Status sink_probe(RuntimeState* state, int child_id, Block* block, bool eos);
-    Status finalize_probe(RuntimeState* state, int child_id);
 
     bool is_child_finished(int child_id) const;
 
+    int64_t* valid_element_in_hash_tbl() { return &_valid_element_in_hash_tbl; }
+
 private:
+    void _finalize_probe(int child_id);
     //Todo: In build process of hashtable, It's same as join node.
     //It's time to abstract out the same methods and provide them directly to others;
     void hash_table_init();
     Status hash_table_build(RuntimeState* state);
-    Status process_build_block(Block& block, uint8_t offset);
+    Status process_build_block(Block& block, RuntimeState* state);
     Status extract_build_column(Block& block, ColumnRawPtrs& raw_ptrs);
     Status extract_probe_column(Block& block, ColumnRawPtrs& raw_ptrs, int child_id);
     void refresh_hash_table();
@@ -95,37 +97,32 @@ private:
 
     std::unique_ptr<HashTableVariants> _hash_table_variants;
 
-    std::vector<size_t> _probe_key_sz;
-    std::vector<size_t> _build_key_sz;
     std::vector<bool> _build_not_ignore_null;
 
-    std::unique_ptr<Arena> _arena;
     //record element size in hashtable
     int64_t _valid_element_in_hash_tbl;
 
     //The i-th result expr list refers to the i-th child.
-    std::vector<std::vector<VExprContext*>> _child_expr_lists;
+    std::vector<VExprContextSPtrs> _child_expr_lists;
     //record build column type
     DataTypes _left_table_data_types;
     //first:column_id, could point to origin column or cast column
     //second:idx mapped to column types
     std::unordered_map<int, int> _build_col_idx;
-    //record memory during running
-    int64_t _mem_used;
     //record insert column id during probe
     std::vector<uint16_t> _probe_column_inserted_id;
 
-    std::vector<Block> _build_blocks;
+    Block _build_block;
     Block _probe_block;
     ColumnRawPtrs _probe_columns;
     std::vector<MutableColumnPtr> _mutable_cols;
-    int _build_block_index;
     bool _build_finished;
     std::vector<bool> _probe_finished_children_index;
     MutableBlock _mutable_block;
-    RuntimeProfile::Counter* _build_timer; // time to build hash table
-    RuntimeProfile::Counter* _probe_timer; // time to probe
-    RuntimeProfile::Counter* _pull_timer;  // time to pull data
+    RuntimeProfile::Counter* _build_timer = nullptr; // time to build hash table
+    RuntimeProfile::Counter* _probe_timer = nullptr; // time to probe
+    RuntimeProfile::Counter* _pull_timer = nullptr;  // time to pull data
+    Arena _arena;
 
     template <class HashTableContext, bool is_intersected>
     friend struct HashTableBuild;

@@ -27,6 +27,8 @@ import org.apache.doris.thrift.TOdbcTableType;
 import org.apache.doris.thrift.TTableDescriptor;
 import org.apache.doris.thrift.TTableType;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Strings;
 import com.google.common.collect.Maps;
 import lombok.Setter;
@@ -39,15 +41,20 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 @Setter
 public class JdbcTable extends Table {
     private static final Logger LOG = LogManager.getLogger(JdbcTable.class);
 
+    private static final ObjectMapper objectMapper = new ObjectMapper();
+
     private static final String TABLE = "table";
+    private static final String REAL_DATABASE = "real_database";
+    private static final String REAL_TABLE = "real_table";
+    private static final String REAL_COLUMNS = "real_columns";
     private static final String RESOURCE = "resource";
     private static final String TABLE_TYPE = "table_type";
     private static final String URL = "jdbc_url";
@@ -59,6 +66,12 @@ public class JdbcTable extends Table {
     private static Map<String, TOdbcTableType> TABLE_TYPE_MAP;
     private String resourceName;
     private String externalTableName;
+
+    // real name only for jdbc catalog
+    private String realDatabaseName;
+    private String realTableName;
+    private Map<String, String> realColumnNames;
+
     private String jdbcTypeName;
 
     private String jdbcUrl;
@@ -70,6 +83,7 @@ public class JdbcTable extends Table {
 
     static {
         Map<String, TOdbcTableType> tempMap = new CaseInsensitiveMap();
+        tempMap.put("nebula", TOdbcTableType.NEBULA);
         tempMap.put("mysql", TOdbcTableType.MYSQL);
         tempMap.put("postgresql", TOdbcTableType.POSTGRESQL);
         tempMap.put("sqlserver", TOdbcTableType.SQLSERVER);
@@ -77,6 +91,7 @@ public class JdbcTable extends Table {
         tempMap.put("clickhouse", TOdbcTableType.CLICKHOUSE);
         tempMap.put("sap_hana", TOdbcTableType.SAP_HANA);
         tempMap.put("trino", TOdbcTableType.TRINO);
+        tempMap.put("presto", TOdbcTableType.PRESTO);
         tempMap.put("oceanbase", TOdbcTableType.OCEANBASE);
         tempMap.put("oceanbase_oracle", TOdbcTableType.OCEANBASE_ORACLE);
         TABLE_TYPE_MAP = Collections.unmodifiableMap(tempMap);
@@ -94,6 +109,26 @@ public class JdbcTable extends Table {
 
     public JdbcTable(long id, String name, List<Column> schema, TableType type) {
         super(id, name, type, schema);
+    }
+
+    public String getInsertSql(List<String> insertCols) {
+        StringBuilder sb = new StringBuilder("INSERT INTO ");
+        sb.append(getProperRealFullTableName(TABLE_TYPE_MAP.get(getTableTypeName())));
+        sb.append("(");
+        List<String> transformedInsertCols = insertCols.stream()
+                .map(col -> getProperRealColumnName(TABLE_TYPE_MAP.get(getTableTypeName()), col))
+                .collect(Collectors.toList());
+        sb.append(String.join(",", transformedInsertCols));
+        sb.append(")");
+        sb.append(" VALUES (");
+        for (int i = 0; i < insertCols.size(); ++i) {
+            if (i != 0) {
+                sb.append(", ");
+            }
+            sb.append("?");
+        }
+        sb.append(")");
+        return sb.toString();
     }
 
     public String getCheckSum() {
@@ -169,6 +204,9 @@ public class JdbcTable extends Table {
         serializeMap.put(DRIVER_CLASS, driverClass);
         serializeMap.put(DRIVER_URL, driverUrl);
         serializeMap.put(CHECK_SUM, checkSum);
+        serializeMap.put(REAL_DATABASE, realDatabaseName);
+        serializeMap.put(REAL_TABLE, realTableName);
+        serializeMap.put(REAL_COLUMNS, objectMapper.writeValueAsString(realColumnNames));
 
         int size = (int) serializeMap.values().stream().filter(v -> {
             return v != null;
@@ -203,6 +241,15 @@ public class JdbcTable extends Table {
         driverClass = serializeMap.get(DRIVER_CLASS);
         driverUrl = serializeMap.get(DRIVER_URL);
         checkSum = serializeMap.get(CHECK_SUM);
+        realDatabaseName = serializeMap.get(REAL_DATABASE);
+        realTableName = serializeMap.get(REAL_TABLE);
+        String realColumnNamesJson = serializeMap.get(REAL_COLUMNS);
+        if (realColumnNamesJson != null) {
+            realColumnNames = objectMapper.readValue(realColumnNamesJson, new TypeReference<Map<String, String>>() {
+            });
+        } else {
+            realColumnNames = Maps.newHashMap();
+        }
     }
 
     public String getResourceName() {
@@ -211,6 +258,31 @@ public class JdbcTable extends Table {
 
     public String getJdbcTable() {
         return externalTableName;
+    }
+
+    public String getRealDatabaseName() {
+        return realDatabaseName;
+    }
+
+    public String getRealTableName() {
+        return realTableName;
+    }
+
+    public String getProperRealFullTableName(TOdbcTableType tableType) {
+        if (realDatabaseName == null || realTableName == null) {
+            return databaseProperName(tableType, externalTableName);
+        } else {
+            return properNameWithRealName(tableType, realDatabaseName) + "." + properNameWithRealName(tableType,
+                    realTableName);
+        }
+    }
+
+    public String getProperRealColumnName(TOdbcTableType tableType, String columnName) {
+        if (realColumnNames == null || realColumnNames.isEmpty() || !realColumnNames.containsKey(columnName)) {
+            return databaseProperName(tableType, columnName);
+        } else {
+            return properNameWithRealName(tableType, realColumnNames.get(columnName));
+        }
     }
 
     public String getTableTypeName() {
@@ -271,10 +343,7 @@ public class JdbcTable extends Table {
             throw new DdlException("property " + TABLE_TYPE + " must be set");
         }
 
-        Map<String, TOdbcTableType> tableTypeMapWithoutOceanbaseOracle = new HashMap<>(TABLE_TYPE_MAP);
-        tableTypeMapWithoutOceanbaseOracle.remove("oceanbase_oracle");
-
-        if (!tableTypeMapWithoutOceanbaseOracle.containsKey(jdbcTypeName.toLowerCase())) {
+        if (!TABLE_TYPE_MAP.containsKey(jdbcTypeName.toLowerCase())) {
             throw new DdlException("Unknown jdbc table type: " + jdbcTypeName);
         }
 
@@ -294,18 +363,106 @@ public class JdbcTable extends Table {
         driverUrl = jdbcResource.getProperty(DRIVER_URL);
         checkSum = jdbcResource.getProperty(CHECK_SUM);
 
-        // get oceanbase_mode
-        String oceanbaseMode = jdbcResource.getProperty("oceanbase_mode");
-
-        // by oceanbase_mode set jdbcTypeName
-        if ("oceanbase".equalsIgnoreCase(jdbcTypeName)) {
-            if ("mysql".equalsIgnoreCase(oceanbaseMode)) {
-                jdbcTypeName = "oceanbase";
-            } else if ("oracle".equalsIgnoreCase(oceanbaseMode)) {
-                jdbcTypeName = "oceanbase_oracle";
-            } else {
-                throw new DdlException("Unknown oceanbase_mode: " + oceanbaseMode);
+        String urlType = jdbcUrl.split(":")[1];
+        if (!jdbcTypeName.equalsIgnoreCase(urlType)) {
+            if (!(jdbcTypeName.equalsIgnoreCase("oceanbase_oracle") && urlType.equalsIgnoreCase("oceanbase"))
+                    && !(jdbcTypeName.equalsIgnoreCase("sap_hana") && urlType.equalsIgnoreCase("sap"))) {
+                throw new DdlException("property " + TABLE_TYPE + " must be same with resource url");
             }
         }
+    }
+
+    /**
+     * Formats the provided name (for example, a database, table, or schema name) according to the specified parameters.
+     *
+     * @param name The name to be formatted.
+     * @param wrapStart The character(s) to be added at the start of each name component.
+     * @param wrapEnd The character(s) to be added at the end of each name component.
+     * @param toUpperCase If true, convert the name to upper case.
+     * @param toLowerCase If true, convert the name to lower case.
+     *         <p>
+     *         Note: If both toUpperCase and toLowerCase are true, the name will ultimately be converted to lower case.
+     *         <p>
+     *         The name is expected to be in the format of 'schemaName.tableName'. If there is no '.',
+     *         the function will treat the entire string as one name component.
+     *         If there is a '.', the function will treat the string before the first '.' as the schema name
+     *         and the string after the '.' as the table name.
+     * @return The formatted name.
+     */
+    public static String formatName(String name, String wrapStart, String wrapEnd, boolean toUpperCase,
+            boolean toLowerCase) {
+        int index = name.indexOf(".");
+        if (index == -1) { // No dot in the name
+            String newName = toUpperCase ? name.toUpperCase() : name;
+            newName = toLowerCase ? newName.toLowerCase() : newName;
+            return wrapStart + newName + wrapEnd;
+        } else {
+            String schemaName = toUpperCase ? name.substring(0, index).toUpperCase() : name.substring(0, index);
+            schemaName = toLowerCase ? schemaName.toLowerCase() : schemaName;
+            String tableName = toUpperCase ? name.substring(index + 1).toUpperCase() : name.substring(index + 1);
+            tableName = toLowerCase ? tableName.toLowerCase() : tableName;
+            return wrapStart + schemaName + wrapEnd + "." + wrapStart + tableName + wrapEnd;
+        }
+    }
+
+    /**
+     * Formats a database name according to the database type.
+     * <p>
+     * Rules:
+     * - MYSQL, OCEANBASE: Wrap with backticks (`), case unchanged. Example: mySchema.myTable -> `mySchema.myTable`
+     * - SQLSERVER: Wrap with square brackets ([]), case unchanged. Example: mySchema.myTable -> [mySchema].[myTable]
+     * - POSTGRESQL, CLICKHOUSE, TRINO, OCEANBASE_ORACLE, SAP_HANA: Wrap with double quotes ("), case unchanged.
+     * Example: mySchema.myTable -> "mySchema"."myTable"
+     * - ORACLE: Wrap with double quotes ("), convert to upper case. Example: mySchema.myTable -> "MYSCHEMA"."MYTABLE"
+     * For other types, the name is returned as is.
+     *
+     * @param tableType The database type.
+     * @param name The name to be formatted, expected in 'schemaName.tableName' format. If no '.', treats entire string
+     *         as one name component. If '.', treats string before first '.' as schema name and after as table name.
+     * @return The formatted name.
+     */
+    public static String databaseProperName(TOdbcTableType tableType, String name) {
+        switch (tableType) {
+            case MYSQL:
+            case OCEANBASE:
+                return formatName(name, "`", "`", false, false);
+            case SQLSERVER:
+                return formatName(name, "[", "]", false, false);
+            case POSTGRESQL:
+            case CLICKHOUSE:
+            case TRINO:
+            case PRESTO:
+            case OCEANBASE_ORACLE:
+            case SAP_HANA:
+                return formatName(name, "\"", "\"", false, false);
+            case ORACLE:
+                return formatName(name, "\"", "\"", true, false);
+            default:
+                return name;
+        }
+    }
+
+    public static String properNameWithRealName(TOdbcTableType tableType, String name) {
+        switch (tableType) {
+            case MYSQL:
+            case OCEANBASE:
+                return formatNameWithRealName(name, "`", "`");
+            case SQLSERVER:
+                return formatNameWithRealName(name, "[", "]");
+            case POSTGRESQL:
+            case CLICKHOUSE:
+            case TRINO:
+            case PRESTO:
+            case OCEANBASE_ORACLE:
+            case ORACLE:
+            case SAP_HANA:
+                return formatNameWithRealName(name, "\"", "\"");
+            default:
+                return name;
+        }
+    }
+
+    public static String formatNameWithRealName(String name, String wrapStart, String wrapEnd) {
+        return wrapStart + name + wrapEnd;
     }
 }

@@ -115,8 +115,29 @@ public class FillUpMissingSlots implements AnalysisRuleFactory {
                             if (notChanged && a.equals(agg)) {
                                 return null;
                             }
-                            return notChanged ? sort.withChildren(a) : new LogicalSort<>(newOrderKeys, a);
+                            return notChanged ? sort.withChildren(sort.child().withChildren(a))
+                                    : new LogicalSort<>(newOrderKeys, sort.child().withChildren(a));
                         });
+                    })
+            ),
+            RuleType.FILL_UP_SORT_HAVING_PROJECT.build(
+                    logicalSort(logicalHaving(logicalProject())).then(sort -> {
+                        Set<Slot> childOutput = sort.child().getOutputSet();
+                        Set<Slot> notExistedInProject = sort.getOrderKeys().stream()
+                                .map(OrderKey::getExpr)
+                                .map(Expression::getInputSlots)
+                                .flatMap(Set::stream)
+                                .filter(s -> !childOutput.contains(s))
+                                .collect(Collectors.toSet());
+                        if (notExistedInProject.size() == 0) {
+                            return null;
+                        }
+                        LogicalProject<?> project = sort.child().child();
+                        List<NamedExpression> projects = ImmutableList.<NamedExpression>builder()
+                                .addAll(project.getProjects())
+                                .addAll(notExistedInProject).build();
+                        Plan child = sort.withChildren(sort.child().withChildren(project.withProjects(projects)));
+                        return new LogicalProject<>(ImmutableList.copyOf(project.getOutput()), child);
                     })
             ),
             RuleType.FILL_UP_HAVING_AGGREGATE.build(
@@ -238,7 +259,7 @@ public class FillUpMissingSlots implements AnalysisRuleFactory {
         }
 
         private void generateAliasForNewOutputSlots(Expression expression) {
-            Alias alias = new Alias(expression, expression.toSql());
+            Alias alias = new Alias(expression);
             newOutputSlots.add(alias);
             substitution.put(expression, alias.toSlot());
         }

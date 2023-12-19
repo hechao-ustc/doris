@@ -72,8 +72,8 @@ class FunctionUnaryArithmetic : public IFunction {
                                    DataTypeInt8, DataTypeInt16, DataTypeInt32, DataTypeInt64,
                                    DataTypeInt128, DataTypeFloat32, DataTypeFloat64,
                                    DataTypeDecimal<Decimal32>, DataTypeDecimal<Decimal64>,
-                                   DataTypeDecimal<Decimal128>, DataTypeDecimal<Decimal128I>>(
-                type, std::forward<F>(f));
+                                   DataTypeDecimal<Decimal128>, DataTypeDecimal<Decimal128I>,
+                                   DataTypeDecimal<Decimal256>>(type, std::forward<F>(f));
     }
 
 public:
@@ -84,8 +84,6 @@ public:
 
     size_t get_number_of_arguments() const override { return 1; }
     bool get_is_injective(const Block&) override { return is_injective; }
-
-    bool use_default_implementation_for_constants() const override { return true; }
 
     DataTypePtr get_return_type_impl(const DataTypes& arguments) const override {
         DataTypePtr result;
@@ -109,7 +107,7 @@ public:
     }
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) override {
+                        size_t result, size_t input_rows_count) const override {
         bool valid =
                 cast_type(block.get_by_position(arguments[0]).type.get(), [&](const auto& type) {
                     using DataType = std::decay_t<decltype(type)>;
@@ -148,8 +146,6 @@ public:
         }
         return Status::OK();
     }
-
-    bool has_information_about_monotonicity() const override { return false; }
 };
 
 struct PositiveMonotonicity {

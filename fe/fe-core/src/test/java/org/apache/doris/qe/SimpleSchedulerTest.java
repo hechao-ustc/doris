@@ -46,6 +46,7 @@ public class SimpleSchedulerTest {
 
     @BeforeClass
     public static void setUp() {
+        SimpleScheduler.init();
         FeConstants.heartbeat_interval_second = 2;
         be1 = new Backend(1000L, "192.168.100.0", 9050);
         be2 = new Backend(1001L, "192.168.100.1", 9050);
@@ -91,7 +92,7 @@ public class SimpleSchedulerTest {
                     for (int i = 0; i < 1000; i++) {
                         TNetworkAddress address = SimpleScheduler.getHost(locations.get(0).backend_id, locations, backends, ref);
                         Assert.assertNotNull(address);
-                        if (!foundCandidate && address.getHostname().equals(be2.getIp())) {
+                        if (!foundCandidate && address.getHostname().equals(be2.getHost())) {
                             foundCandidate = true;
                         }
                     }

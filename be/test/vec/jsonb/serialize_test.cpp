@@ -26,6 +26,7 @@
 #include <memory>
 #include <string>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -59,6 +60,7 @@
 #include "vec/data_types/data_type_number.h"
 #include "vec/data_types/data_type_string.h"
 #include "vec/data_types/data_type_time_v2.h"
+#include "vec/data_types/serde/data_type_serde.h"
 #include "vec/runtime/vdatetime_value.h"
 
 namespace doris::vectorized {
@@ -126,12 +128,15 @@ TEST(BlockSerializeTest, Array) {
     MutableColumnPtr col = ColumnString::create();
     // serialize
     JsonbSerializeUtil::block_to_jsonb(schema, block, static_cast<ColumnString&>(*col.get()),
-                                       block.columns());
+                                       block.columns(),
+                                       create_data_type_serdes(block.get_data_types()));
     // deserialize
     TupleDescriptor read_desc(PTupleDescriptor(), true);
     // slot1
     TSlotDescriptor tslot1;
     tslot1.__set_colName("k1");
+    tslot1.nullIndicatorBit = -1;
+    tslot1.nullIndicatorByte = 0;
     TypeDescriptor type_desc(TYPE_ARRAY);
     type_desc.children.push_back(TypeDescriptor(TYPE_INT));
     type_desc.contains_nulls.push_back(true);
@@ -143,6 +148,8 @@ TEST(BlockSerializeTest, Array) {
     // slot2
     TSlotDescriptor tslot2;
     tslot2.__set_colName("k2");
+    tslot2.nullIndicatorBit = -1;
+    tslot2.nullIndicatorByte = 0;
     TypeDescriptor type_desc2(TYPE_ARRAY);
     type_desc2.children.push_back(TypeDescriptor(TYPE_STRING));
     type_desc2.contains_nulls.push_back(true);
@@ -152,8 +159,19 @@ TEST(BlockSerializeTest, Array) {
     read_desc.add_slot(slot2);
 
     Block new_block = block.clone_empty();
-    JsonbSerializeUtil::jsonb_to_block(read_desc, static_cast<ColumnString&>(*col.get()),
-                                       new_block);
+    std::unordered_map<uint32_t, uint32_t> col_uid_to_idx;
+    std::vector<std::string> default_values;
+    default_values.resize(read_desc.slots().size());
+    for (int i = 0; i < read_desc.slots().size(); ++i) {
+        col_uid_to_idx[read_desc.slots()[i]->col_unique_id()] = i;
+        default_values[i] = read_desc.slots()[i]->col_default_value();
+        std::cout << "uid " << read_desc.slots()[i]->col_unique_id() << ":" << i << std::endl;
+    }
+    std::cout << block.dump_data() << std::endl;
+    std::cout << new_block.dump_data() << std::endl;
+    JsonbSerializeUtil::jsonb_to_block(create_data_type_serdes(read_desc.slots()),
+                                       static_cast<ColumnString&>(*col.get()), col_uid_to_idx,
+                                       new_block, default_values);
     std::cout << block.dump_data() << std::endl;
     std::cout << new_block.dump_data() << std::endl;
     EXPECT_EQ(block.dump_data(), new_block.dump_data());
@@ -290,7 +308,7 @@ TEST(BlockSerializeTest, JsonbBlock) {
         auto column_vector_date_v2 = vectorized::ColumnVector<vectorized::UInt32>::create();
         auto& date_v2_data = column_vector_date_v2->get_data();
         for (int i = 0; i < 1024; ++i) {
-            vectorized::DateV2Value<doris::vectorized::DateV2ValueType> value;
+            DateV2Value<DateV2ValueType> value;
             value.from_date((uint32_t)((2022 << 9) | (6 << 5) | 6));
             date_v2_data.push_back(*reinterpret_cast<vectorized::UInt32*>(&value));
         }
@@ -302,7 +320,8 @@ TEST(BlockSerializeTest, JsonbBlock) {
     MutableColumnPtr col = ColumnString::create();
     // serialize
     JsonbSerializeUtil::block_to_jsonb(schema, block, static_cast<ColumnString&>(*col.get()),
-                                       block.columns());
+                                       block.columns(),
+                                       create_data_type_serdes(block.get_data_types()));
     // deserialize
     TupleDescriptor read_desc(PTupleDescriptor(), true);
     for (auto t : cols) {
@@ -322,8 +341,15 @@ TEST(BlockSerializeTest, JsonbBlock) {
         read_desc.add_slot(slot);
     }
     Block new_block = block.clone_empty();
-    JsonbSerializeUtil::jsonb_to_block(read_desc, static_cast<const ColumnString&>(*col.get()),
-                                       new_block);
+    std::unordered_map<uint32_t, uint32_t> col_uid_to_idx;
+    std::vector<std::string> default_values;
+    default_values.resize(read_desc.slots().size());
+    for (int i = 0; i < read_desc.slots().size(); ++i) {
+        col_uid_to_idx[read_desc.slots()[i]->col_unique_id()] = i;
+    }
+    JsonbSerializeUtil::jsonb_to_block(create_data_type_serdes(block.get_data_types()),
+                                       static_cast<const ColumnString&>(*col.get()), col_uid_to_idx,
+                                       new_block, default_values);
     std::cout << block.dump_data() << std::endl;
     std::cout << new_block.dump_data() << std::endl;
     EXPECT_EQ(block.dump_data(), new_block.dump_data());

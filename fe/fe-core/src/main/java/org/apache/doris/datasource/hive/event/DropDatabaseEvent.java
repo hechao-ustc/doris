@@ -32,6 +32,11 @@ import java.util.List;
  */
 public class DropDatabaseEvent extends MetastoreEvent {
 
+    // for test
+    public DropDatabaseEvent(long eventId, String catalogName, String dbName) {
+        super(eventId, catalogName, dbName, null, MetastoreEventType.DROP_DATABASE);
+    }
+
     private DropDatabaseEvent(NotificationEvent event,
             String catalogName) {
         super(event, catalogName);
@@ -48,10 +53,10 @@ public class DropDatabaseEvent extends MetastoreEvent {
         try {
             infoLog("catalogName:[{}],dbName:[{}]", catalogName, dbName);
             Env.getCurrentEnv().getCatalogMgr()
-                    .dropExternalDatabase(dbName, catalogName);
+                    .dropExternalDatabase(dbName, catalogName, true);
         } catch (DdlException e) {
             throw new MetastoreNotificationException(
-                    debugString("Failed to process event"));
+                    debugString("Failed to process event"), e);
         }
     }
 }

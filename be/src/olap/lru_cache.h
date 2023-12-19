@@ -22,7 +22,6 @@
 #include "runtime/memory/mem_tracker_limiter.h"
 #include "runtime/thread_context.h"
 #include "util/doris_metrics.h"
-#include "util/lock.h"
 #include "util/metrics.h"
 #include "util/slice.h"
 
@@ -58,11 +57,6 @@ enum LRUCacheType {
     SIZE,  // The capacity of cache is based on the size of cache entry.
     NUMBER // The capacity of cache is based on the number of cache entry.
 };
-
-// Create a new cache with a specified name and capacity.
-// This implementation of Cache uses a least-recently-used eviction policy.
-extern Cache* new_lru_cache(const std::string& name, size_t capacity,
-                            LRUCacheType type = LRUCacheType::SIZE, uint32_t num_shards = 16);
 
 class CacheKey {
 public:
@@ -144,7 +138,7 @@ private:
         return result;
     }
 
-    const char* _data;
+    const char* _data = nullptr;
     size_t _size;
 };
 
@@ -239,12 +233,12 @@ private:
 
 // An entry is a variable length heap-allocated structure.  Entries
 // are kept in a circular doubly linked list ordered by access time.
-typedef struct LRUHandle {
-    void* value;
+struct LRUHandle {
+    void* value = nullptr;
     void (*deleter)(const CacheKey&, void* value);
-    LRUHandle* next_hash = nullptr; // next entry in hash table
-    LRUHandle* next = nullptr;      // next entry in lru list
-    LRUHandle* prev = nullptr;      // previous entry in lru list
+    struct LRUHandle* next_hash = nullptr; // next entry in hash table
+    struct LRUHandle* next = nullptr;      // next entry in lru list
+    struct LRUHandle* prev = nullptr;      // previous entry in lru list
     size_t charge;
     size_t key_length;
     size_t total_size; // including key length
@@ -254,8 +248,8 @@ typedef struct LRUHandle {
     uint32_t hash; // Hash of key(); used for fast sharding and comparisons
     CachePriority priority = CachePriority::NORMAL;
     MemTrackerLimiter* mem_tracker;
-    char key_data[1]; // Beginning of key
     LRUCacheType type;
+    char key_data[1]; // Beginning of key
 
     CacheKey key() const {
         // For cheaper lookups, we allow a temporary Handle object
@@ -273,8 +267,7 @@ typedef struct LRUHandle {
         DorisMetrics::instance()->lru_cache_memory_bytes->increment(-bytes);
         ::free(this);
     }
-
-} LRUHandle;
+};
 
 // We provide our own simple hash tablet since it removes a whole bunch
 // of porting hacks and is also faster than some of the built-in hash
@@ -309,7 +302,7 @@ private:
     // a linked list of cache entries that hash into the bucket.
     uint32_t _length;
     uint32_t _elems;
-    LRUHandle** _list;
+    LRUHandle** _list = nullptr;
 
     // Return a pointer to slot that points to a cache entry that
     // matches key/hash.  If there is no such cache entry, return a
@@ -371,7 +364,7 @@ private:
     size_t _capacity = 0;
 
     // _mutex protects the following state.
-    doris::Mutex _mutex;
+    std::mutex _mutex;
     size_t _usage = 0;
 
     // Dummy head of LRU list.
@@ -396,8 +389,9 @@ private:
 
 class ShardedLRUCache : public Cache {
 public:
-    explicit ShardedLRUCache(const std::string& name, size_t total_capacity, LRUCacheType type,
-                             uint32_t num_shards, uint32_t element_count_capacity = 0);
+    explicit ShardedLRUCache(const std::string& name, size_t total_capacity,
+                             LRUCacheType type = LRUCacheType::SIZE, uint32_t num_shards = 16,
+                             uint32_t element_count_capacity = 0);
     explicit ShardedLRUCache(const std::string& name, size_t total_capacity, LRUCacheType type,
                              uint32_t num_shards,
                              CacheValueTimeExtractor cache_value_time_extractor,
@@ -423,6 +417,17 @@ public:
 private:
     void update_cache_metrics() const;
 
+    static std::string lru_cache_type_string(LRUCacheType type) {
+        switch (type) {
+        case LRUCacheType::SIZE:
+            return "size";
+        case LRUCacheType::NUMBER:
+            return "number";
+        default:
+            LOG(FATAL) << "not match type of lru cache:" << static_cast<int>(type);
+        }
+    }
+
 private:
     static uint32_t _hash_slice(const CacheKey& s);
     uint32_t _shard(uint32_t hash) {
@@ -432,18 +437,23 @@ private:
     std::string _name;
     const int _num_shard_bits;
     const uint32_t _num_shards;
-    LRUCache** _shards;
+    LRUCache** _shards = nullptr;
     std::atomic<uint64_t> _last_id;
     size_t _total_capacity;
 
     std::unique_ptr<MemTrackerLimiter> _mem_tracker;
-    std::shared_ptr<MetricEntity> _entity = nullptr;
+    std::shared_ptr<MetricEntity> _entity;
     IntGauge* cache_capacity = nullptr;
     IntGauge* cache_usage = nullptr;
     DoubleGauge* cache_usage_ratio = nullptr;
     IntAtomicCounter* cache_lookup_count = nullptr;
     IntAtomicCounter* cache_hit_count = nullptr;
     DoubleGauge* cache_hit_ratio = nullptr;
+    // bvars
+    std::unique_ptr<bvar::Adder<uint64_t>> _hit_count_bvar;
+    std::unique_ptr<bvar::PerSecond<bvar::Adder<uint64_t>>> _hit_count_per_second;
+    std::unique_ptr<bvar::Adder<uint64_t>> _lookup_count_bvar;
+    std::unique_ptr<bvar::PerSecond<bvar::Adder<uint64_t>>> _lookup_count_per_second;
 };
 
 } // namespace doris

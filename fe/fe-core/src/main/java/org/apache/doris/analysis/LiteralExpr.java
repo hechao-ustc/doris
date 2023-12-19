@@ -21,6 +21,7 @@
 package org.apache.doris.analysis;
 
 import org.apache.doris.catalog.PrimitiveType;
+import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.NotImplementedException;
@@ -35,6 +36,7 @@ import java.io.DataOutput;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.List;
+import java.util.Optional;
 
 public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr> {
     private static final Logger LOG = LogManager.getLogger(LiteralExpr.class);
@@ -74,6 +76,7 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
             case DECIMAL32:
             case DECIMAL64:
             case DECIMAL128:
+            case DECIMAL256:
                 literalExpr = new DecimalLiteral(value);
                 break;
             case CHAR:
@@ -92,6 +95,12 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
             case DATETIMEV2:
                 literalExpr = new DateLiteral(value, type);
                 break;
+            case IPV4:
+                literalExpr = new IPv4Literal(value);
+                break;
+            case IPV6:
+                literalExpr = new IPv6Literal(value);
+                break;
             default:
                 throw new AnalysisException("Type[" + type.toSql() + "] not supported.");
         }
@@ -99,6 +108,21 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
         Preconditions.checkNotNull(literalExpr);
         return literalExpr;
     }
+
+
+    public static String getStringLiteralForComplexType(Expr v) {
+        if (!(v instanceof NullLiteral) && v.getType().isScalarType()
+                && (Type.getNumericTypes().contains((ScalarType) v.getActualScalarType(v.getType()))
+                || v.getType() == Type.BOOLEAN)) {
+            return v.getStringValueInFe();
+        } else if (v.getType().isComplexType()) {
+            // these type should also call getStringValueInFe which should handle special case for itself
+            return v.getStringValueInFe();
+        } else {
+            return v.getStringValueForArray();
+        }
+    }
+
 
     /**
      * Init LiteralExpr's Type information
@@ -135,6 +159,39 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
 
         Preconditions.checkNotNull(literalExpr);
         return literalExpr;
+    }
+
+    public Expr convertTo(Type targetType) throws AnalysisException {
+        Preconditions.checkArgument(!targetType.equals(Type.INVALID));
+        if (this instanceof NullLiteral) {
+            return NullLiteral.create(targetType);
+        } else if (targetType.isBoolean()) {
+            if (this instanceof StringLiteral || this instanceof JsonLiteral) {
+                return new BoolLiteral(getStringValue());
+            } else {
+                if (getLongValue() != 0) {
+                    return new BoolLiteral(true);
+                } else {
+                    return new BoolLiteral(false);
+                }
+            }
+        } else if (targetType.isIntegerType()) {
+            return new IntLiteral(getLongValue(), targetType);
+        } else if (targetType.isLargeIntType()) {
+            return new LargeIntLiteral(getStringValue());
+        } else if (targetType.isFloatingPointType()) {
+            return new FloatLiteral(getDoubleValue(), targetType);
+        } else if (targetType.isDecimalV2() || targetType.isDecimalV3()) {
+            DecimalLiteral literal = new DecimalLiteral(getStringValue(),
+                    ((ScalarType) targetType).getScalarScale());
+            literal.setType(targetType);
+            return literal;
+        } else if (targetType.isStringType()) {
+            return new StringLiteral(getStringValue());
+        } else if (targetType.isDateType()) {
+            return new StringLiteral(getStringValue()).convertToDate(targetType);
+        }
+        return this;
     }
 
     public static LiteralExpr createInfinity(Type type, boolean isMax) throws AnalysisException {
@@ -191,6 +248,10 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
     // method unescapes string values.
     @Override
     public abstract String getStringValue();
+
+    public String getStringValueInFe() {
+        return getStringValue();
+    }
 
     @Override
     public abstract String getStringValueForArray();
@@ -321,6 +382,14 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
             default:
                 return null;
         }
+    }
+
+    @Override
+    public String getExprName() {
+        if (!this.exprName.isPresent()) {
+            this.exprName = Optional.of("literal");
+        }
+        return this.exprName.get();
     }
 
     // Port from mysql get_param_length

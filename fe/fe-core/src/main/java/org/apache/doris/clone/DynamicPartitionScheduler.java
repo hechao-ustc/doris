@@ -109,6 +109,11 @@ public class DynamicPartitionScheduler extends MasterDaemon {
         dynamicPartitionTableInfo.add(Pair.of(dbId, tableId));
     }
 
+    // only for test
+    public boolean containsDynamicPartitionTable(Long dbId, Long tableId) {
+        return dynamicPartitionTableInfo.contains(Pair.of(dbId, tableId));
+    }
+
     public void removeDynamicPartitionTable(Long dbId, Long tableId) {
         dynamicPartitionTableInfo.remove(Pair.of(dbId, tableId));
     }
@@ -205,7 +210,7 @@ public class DynamicPartitionScheduler extends MasterDaemon {
         ArrayList<Long> partitionSizeArray = Lists.newArrayList();
         for (Partition partition : partitions) {
             if (partition.getVisibleVersion() >= 2) {
-                partitionSizeArray.add(partition.getDataSize());
+                partitionSizeArray.add(partition.getAllDataSize(true));
             }
         }
 
@@ -216,7 +221,7 @@ public class DynamicPartitionScheduler extends MasterDaemon {
 
         // plus 5 for uncompressed data
         long uncompressedPartitionSize = getNextPartitionSize(partitionSizeArray) * 5;
-        return AutoBucketUtils.getBucketsNum(uncompressedPartitionSize);
+        return AutoBucketUtils.getBucketsNum(uncompressedPartitionSize, Config.autobucket_min_buckets);
     }
 
     private ArrayList<AddPartitionClause> getAddPartitionClause(Database db, OlapTable olapTable,
@@ -273,8 +278,10 @@ public class DynamicPartitionScheduler extends MasterDaemon {
                 } catch (Exception e) {
                     isPartitionExists = true;
                     if (addPartitionKeyRange.equals(partitionItem.getItems())) {
-                        LOG.info("partition range {} exist in table {}, clear fail msg",
-                                addPartitionKeyRange, olapTable.getName());
+                        if (LOG.isDebugEnabled()) {
+                            LOG.debug("partition range {} exist in table {}, clear fail msg",
+                                    addPartitionKeyRange, olapTable.getName());
+                        }
                         clearCreatePartitionFailedMsg(olapTable.getId());
                     } else {
                         recordCreatePartitionFailedMsg(db.getFullName(), olapTable.getName(),
@@ -497,6 +504,8 @@ public class DynamicPartitionScheduler extends MasterDaemon {
                     || !olapTable.dynamicPartitionExists()
                     || !olapTable.getTableProperty().getDynamicPartitionProperty().getEnable()) {
                 iterator.remove();
+                continue;
+            } else if (olapTable.isBeingSynced()) {
                 continue;
             }
             olapTable.readLock();

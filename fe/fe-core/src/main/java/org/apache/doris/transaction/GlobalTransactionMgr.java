@@ -55,6 +55,8 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -132,23 +134,32 @@ public class GlobalTransactionMgr implements Writable {
             TxnCoordinator coordinator, LoadJobSourceType sourceType, long listenerId, long timeoutSecond)
             throws AnalysisException, LabelAlreadyUsedException, BeginTransactionException, DuplicatedRequestException,
             QuotaExceedException, MetaNotFoundException {
+        try {
+            if (Config.disable_load_job) {
+                throw new AnalysisException("disable_load_job is set to true, all load jobs are prevented");
+            }
 
-        if (Config.disable_load_job) {
-            throw new AnalysisException("disable_load_job is set to true, all load jobs are prevented");
-        }
+            switch (sourceType) {
+                case BACKEND_STREAMING:
+                    checkValidTimeoutSecond(timeoutSecond, Config.max_stream_load_timeout_second,
+                            Config.min_load_timeout_second);
+                    break;
+                default:
+                    checkValidTimeoutSecond(timeoutSecond, Config.max_load_timeout_second,
+                            Config.min_load_timeout_second);
+            }
 
-        switch (sourceType) {
-            case BACKEND_STREAMING:
-                checkValidTimeoutSecond(timeoutSecond, Config.max_stream_load_timeout_second,
-                        Config.min_load_timeout_second);
-                break;
-            default:
-                checkValidTimeoutSecond(timeoutSecond, Config.max_load_timeout_second, Config.min_load_timeout_second);
-        }
-
-        DatabaseTransactionMgr dbTransactionMgr = getDatabaseTransactionMgr(dbId);
-        return dbTransactionMgr.beginTransaction(tableIdList, label, requestId,
+            DatabaseTransactionMgr dbTransactionMgr = getDatabaseTransactionMgr(dbId);
+            return dbTransactionMgr.beginTransaction(tableIdList, label, requestId,
                 coordinator, sourceType, listenerId, timeoutSecond);
+        } catch (DuplicatedRequestException e) {
+            throw e;
+        } catch (Exception e) {
+            if (MetricRepo.isInit) {
+                MetricRepo.COUNTER_TXN_REJECT.increase(1L);
+            }
+            throw e;
+        }
     }
 
     private void checkValidTimeoutSecond(long timeoutSecond, int maxLoadTimeoutSecond,
@@ -174,7 +185,7 @@ public class GlobalTransactionMgr implements Writable {
     public Long getTransactionId(long dbId, String label) {
         try {
             DatabaseTransactionMgr dbTransactionMgr = getDatabaseTransactionMgr(dbId);
-            return dbTransactionMgr.getTransactionId(label);
+            return dbTransactionMgr.getTransactionIdByLabel(label);
         } catch (AnalysisException e) {
             LOG.warn("Get transaction id by label " + label + " failed", e);
             return null;
@@ -391,13 +402,13 @@ public class GlobalTransactionMgr implements Writable {
     /**
      * if the table is deleted between commit and publish version, then should ignore the partition
      *
+     * @param dbId
      * @param transactionId
-     * @param errorReplicaIds
      * @return
      */
-    public void finishTransaction(long dbId, long transactionId, Set<Long> errorReplicaIds) throws UserException {
+    public void finishTransaction(long dbId, long transactionId) throws UserException {
         DatabaseTransactionMgr dbTransactionMgr = getDatabaseTransactionMgr(dbId);
-        dbTransactionMgr.finishTransaction(transactionId, errorReplicaIds);
+        dbTransactionMgr.finishTransaction(transactionId);
     }
 
     /**
@@ -421,6 +432,19 @@ public class GlobalTransactionMgr implements Writable {
             LOG.warn("Check whether all previous transactions in db [" + dbId + "] finished failed", e);
             throw e;
         }
+    }
+
+    /**
+     * Check whether a load job for a partition already exists before
+     * checking all `TransactionId` related with this load job have finished.
+     * finished
+     *
+     * @throws AnalysisException is database does not exist anymore
+     */
+    public boolean isPreviousTransactionsFinished(long endTransactionId, long dbId, long tableId,
+            long partitionId) throws AnalysisException {
+        DatabaseTransactionMgr dbTransactionMgr = getDatabaseTransactionMgr(dbId);
+        return dbTransactionMgr.isPreviousTransactionsFinished(endTransactionId, tableId, partitionId);
     }
 
     /**
@@ -492,12 +516,14 @@ public class GlobalTransactionMgr implements Writable {
         }
     }
 
-    public List<List<Comparable>> getDbInfo() {
-        List<List<Comparable>> infos = new ArrayList<List<Comparable>>();
+    public List<List<String>> getDbInfo() {
+        List<List<String>> infos = new ArrayList<>();
+        long totalRunningNum = 0;
         List<Long> dbIds = Lists.newArrayList(dbIdToDatabaseTransactionMgrs.keySet());
+        Collections.sort(dbIds);
         for (long dbId : dbIds) {
-            List<Comparable> info = new ArrayList<Comparable>();
-            info.add(dbId);
+            List<String> info = new ArrayList<>();
+            info.add(String.valueOf(dbId));
             Database db = Env.getCurrentInternalCatalog().getDbNullable(dbId);
             if (db == null) {
                 continue;
@@ -507,12 +533,15 @@ public class GlobalTransactionMgr implements Writable {
             try {
                 DatabaseTransactionMgr dbMgr = getDatabaseTransactionMgr(dbId);
                 runningNum = dbMgr.getRunningTxnNums() + dbMgr.getRunningRoutineLoadTxnNums();
+                totalRunningNum += runningNum;
             } catch (AnalysisException e) {
                 LOG.warn("get database running transaction num failed", e);
             }
-            info.add(runningNum);
+            info.add(String.valueOf(runningNum));
             infos.add(info);
         }
+        List<String> info = Arrays.asList("0", "Total", String.valueOf(totalRunningNum));
+        infos.add(info);
         return infos;
     }
 
@@ -721,4 +750,30 @@ public class GlobalTransactionMgr implements Writable {
         return total;
     }
 
+    public List<TransactionState> getPreCommittedTxnList(Long dbId) throws AnalysisException {
+        return getDatabaseTransactionMgr(dbId).getPreCommittedTxnList();
+    }
+
+    public void cleanLabel(Long dbId, String label) throws AnalysisException {
+        getDatabaseTransactionMgr(dbId).cleanLabel(label);
+    }
+
+    public Long getTransactionIdByLabel(Long dbId, String label, List<TransactionStatus> statusList)
+            throws UserException {
+        return getDatabaseTransactionMgr(dbId).getTransactionIdByLabel(label, statusList);
+    }
+
+    public int getRunningTxnNums(Long dbId) throws AnalysisException {
+        return getDatabaseTransactionMgr(dbId).getRunningTxnNums();
+    }
+
+    public void updateMultiTableRunningTransactionTableIds(Long dbId, Long transactionId, List<Long> tableIds)
+            throws AnalysisException {
+        getDatabaseTransactionMgr(dbId).updateMultiTableRunningTransactionTableIds(transactionId, tableIds);
+    }
+
+    public void putTransactionTableNames(Long dbId, Long transactionId, List<Long> tableIds)
+            throws AnalysisException {
+        getDatabaseTransactionMgr(dbId).putTransactionTableNames(transactionId, tableIds);
+    }
 }

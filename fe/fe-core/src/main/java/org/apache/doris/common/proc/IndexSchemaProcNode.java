@@ -18,6 +18,7 @@
 package org.apache.doris.common.proc;
 
 import org.apache.doris.catalog.Column;
+import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.FeConstants;
 
@@ -48,10 +49,8 @@ public class IndexSchemaProcNode implements ProcNodeInterface {
         this.bfColumns = bfColumns;
     }
 
-    @Override
-    public ProcResult fetchResult() throws AnalysisException {
+    public static ProcResult createResult(List<Column> schema, Set<String> bfColumns) throws AnalysisException {
         Preconditions.checkNotNull(schema);
-
         BaseProcResult result = new BaseProcResult();
         result.setNames(TITLE_NAMES);
 
@@ -59,10 +58,13 @@ public class IndexSchemaProcNode implements ProcNodeInterface {
             // Extra string (aggregation and bloom filter)
             List<String> extras = Lists.newArrayList();
             if (column.getAggregationType() != null) {
-                extras.add(column.getAggregationType().name());
+                extras.add(column.getAggregationString());
             }
             if (bfColumns != null && bfColumns.contains(column.getName())) {
                 extras.add("BLOOM_FILTER");
+            }
+            if (column.isAutoInc()) {
+                extras.add("AUTO_INCREMENT");
             }
             String extraStr = StringUtils.join(extras, ",");
 
@@ -78,11 +80,31 @@ public class IndexSchemaProcNode implements ProcNodeInterface {
                 rowList.set(1, "DATE");
             }
             if (column.getOriginType().isDatetimeV2()) {
-                rowList.set(1, "DATETIME");
+                StringBuilder typeStr = new StringBuilder("DATETIME");
+                if (((ScalarType) column.getOriginType()).getScalarScale() > 0) {
+                    typeStr.append("(").append(((ScalarType) column.getOriginType()).getScalarScale()).append(")");
+                }
+                rowList.set(1, typeStr.toString());
+            }
+            if (column.getOriginType().isDecimalV3()) {
+                StringBuilder typeStr = new StringBuilder("DECIMAL");
+                ScalarType sType = (ScalarType) column.getOriginType();
+                int scale = sType.getScalarScale();
+                int precision = sType.getScalarPrecision();
+                // not default
+                if (scale > 0 && precision != 9) {
+                    typeStr.append("(").append(precision).append(", ").append(scale)
+                            .append(")");
+                }
+                rowList.set(1, typeStr.toString());
             }
             result.addRow(rowList);
         }
         return result;
     }
 
+    @Override
+    public ProcResult fetchResult() throws AnalysisException {
+        return createResult(this.schema, this.bfColumns);
+    }
 }
