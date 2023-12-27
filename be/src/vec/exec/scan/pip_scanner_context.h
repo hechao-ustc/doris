@@ -68,7 +68,7 @@ public:
         {
             std::unique_lock<std::mutex> l(*_queue_mutexs[id]);
             if (_blocks_queues[id].empty()) {
-                *eos = _is_finished || _should_stop;
+                *eos = done();
                 return Status::OK();
             }
             if (_process_status.is<ErrorCode::CANCELLED>()) {
@@ -106,6 +106,7 @@ public:
                 static_cast<void>(m.merge(*merge_block));
                 return_free_block(std::move(merge_block));
             }
+            (*block)->set_columns(std::move(m.mutable_columns()));
         }
 
         return Status::OK();
