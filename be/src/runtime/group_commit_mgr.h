@@ -29,7 +29,7 @@
 #include <utility>
 
 #include "common/status.h"
-#include "olap/wal_manager.h"
+#include "olap/wal/wal_manager.h"
 #include "runtime/exec_env.h"
 #include "util/threadpool.h"
 #include "vec/core/block.h"
@@ -55,7 +55,8 @@ public:
               _all_block_queues_bytes(all_block_queues_bytes),
               _group_commit_interval_ms(group_commit_interval_ms) {};
 
-    Status add_block(std::shared_ptr<vectorized::Block> block, bool write_wal);
+    Status add_block(RuntimeState* runtime_state, std::shared_ptr<vectorized::Block> block,
+                     bool write_wal);
     Status get_block(RuntimeState* runtime_state, vectorized::Block* block, bool* find_block,
                      bool* eos);
     Status add_load_id(const UniqueId& load_id);
@@ -65,10 +66,12 @@ public:
                       WalManager* wal_manager, std::vector<TSlotDescriptor>& slot_desc,
                       int be_exe_version);
     Status close_wal();
-    bool has_enough_wal_disk_space(const std::vector<std::shared_ptr<vectorized::Block>>& blocks,
-                                   const TUniqueId& load_id, bool is_blocks_contain_all_load_data);
+    bool has_enough_wal_disk_space(size_t pre_allocated);
 
+    // 1s
     static constexpr size_t MAX_BLOCK_QUEUE_ADD_WAIT_TIME = 1000;
+    // 120s
+    static constexpr size_t WAL_MEM_BACK_PRESSURE_TIME_OUT = 120000;
     UniqueId load_instance_id;
     std::string label;
     int64_t txn_id;
@@ -153,10 +156,6 @@ public:
                                       const UniqueId& load_id,
                                       std::shared_ptr<LoadBlockQueue>& load_block_queue,
                                       int be_exe_version);
-    Status update_load_info(TUniqueId load_id, size_t content_length);
-    Status get_load_info(TUniqueId load_id, size_t* content_length);
-    Status remove_load_info(TUniqueId load_id);
-    std::condition_variable cv;
 
 private:
     ExecEnv* _exec_env = nullptr;
@@ -167,8 +166,6 @@ private:
     std::unique_ptr<doris::ThreadPool> _thread_pool;
     // memory consumption of all tables' load block queues, used for back pressure.
     std::shared_ptr<std::atomic_size_t> _all_block_queues_bytes;
-    std::shared_mutex _load_info_lock;
-    std::unordered_map<TUniqueId, size_t> _load_id_to_content_length_map;
 };
 
 } // namespace doris

@@ -172,7 +172,7 @@ void ScannerScheduler::_schedule_thread(int queue_id) {
 }
 
 void ScannerScheduler::_schedule_scanners(std::shared_ptr<ScannerContext> ctx) {
-    auto task_lock = ctx->get_task_execution_context().lock();
+    auto task_lock = ctx->task_exec_ctx();
     if (task_lock == nullptr) {
         // LOG(WARNING) << "could not lock task execution context, query " << print_id(_query_id)
         //             << " maybe finished";
@@ -266,7 +266,7 @@ void ScannerScheduler::_schedule_scanners(std::shared_ptr<ScannerContext> ctx) {
 
 void ScannerScheduler::_scanner_scan(ScannerScheduler* scheduler,
                                      std::shared_ptr<ScannerContext> ctx, VScannerSPtr scanner) {
-    auto task_lock = ctx->get_task_execution_context().lock();
+    auto task_lock = ctx->task_exec_ctx();
     if (task_lock == nullptr) {
         // LOG(WARNING) << "could not lock task execution context, query " << print_id(_query_id)
         //             << " maybe finished";
@@ -351,7 +351,7 @@ void ScannerScheduler::_scanner_scan(ScannerScheduler* scheduler,
 
         BlockUPtr block = ctx->get_free_block();
 
-        status = scanner->get_block(state, block.get(), &eos);
+        status = scanner->get_block_after_projects(state, block.get(), &eos);
         // The VFileScanner for external table may try to open not exist files,
         // Because FE file cache for external table may out of date.
         // So, NOT_FOUND for VFileScanner is not a fail case.

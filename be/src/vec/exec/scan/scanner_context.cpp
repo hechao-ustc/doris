@@ -46,15 +46,20 @@ namespace doris::vectorized {
 using namespace std::chrono_literals;
 
 ScannerContext::ScannerContext(RuntimeState* state, const TupleDescriptor* output_tuple_desc,
+                               const RowDescriptor* output_row_descriptor,
                                const std::list<VScannerSPtr>& scanners, int64_t limit_,
                                int64_t max_bytes_in_blocks_queue, const int num_parallel_instances,
                                pipeline::ScanLocalStateBase* local_state,
                                std::shared_ptr<pipeline::ScanDependency> dependency,
                                std::shared_ptr<pipeline::Dependency> finish_dependency)
-        : _state(state),
+        : HasTaskExecutionCtx(state),
+          _state(state),
           _parent(nullptr),
           _local_state(local_state),
-          _output_tuple_desc(output_tuple_desc),
+          _output_tuple_desc(output_row_descriptor
+                                     ? output_row_descriptor->tuple_descriptors().front()
+                                     : output_tuple_desc),
+          _output_row_descriptor(output_row_descriptor),
           _process_status(Status::OK()),
           _batch_size(state->batch_size()),
           limit(limit_),
@@ -66,8 +71,8 @@ ScannerContext::ScannerContext(RuntimeState* state, const TupleDescriptor* outpu
           _num_parallel_instances(num_parallel_instances),
           _dependency(dependency),
           _finish_dependency(finish_dependency) {
-    // Use the task exec context as a lock between scanner threads and fragment exection threads
-    _task_exec_ctx = _state->get_task_execution_context();
+    DCHECK(_output_row_descriptor == nullptr ||
+           _output_row_descriptor->tuple_descriptors().size() == 1);
     _query_id = _state->get_query_ctx()->query_id();
     ctx_id = UniqueId::gen_uid().to_string();
     if (_scanners.empty()) {
@@ -92,13 +97,18 @@ ScannerContext::ScannerContext(RuntimeState* state, const TupleDescriptor* outpu
 
 ScannerContext::ScannerContext(doris::RuntimeState* state, doris::vectorized::VScanNode* parent,
                                const doris::TupleDescriptor* output_tuple_desc,
+                               const RowDescriptor* output_row_descriptor,
                                const std::list<VScannerSPtr>& scanners, int64_t limit_,
                                int64_t max_bytes_in_blocks_queue, const int num_parallel_instances,
                                pipeline::ScanLocalStateBase* local_state)
-        : _state(state),
+        : HasTaskExecutionCtx(state),
+          _state(state),
           _parent(parent),
           _local_state(local_state),
-          _output_tuple_desc(output_tuple_desc),
+          _output_tuple_desc(output_row_descriptor
+                                     ? output_row_descriptor->tuple_descriptors().front()
+                                     : output_tuple_desc),
+          _output_row_descriptor(output_row_descriptor),
           _process_status(Status::OK()),
           _batch_size(state->batch_size()),
           limit(limit_),
@@ -108,8 +118,8 @@ ScannerContext::ScannerContext(doris::RuntimeState* state, doris::vectorized::VS
           _scanners(scanners),
           _scanners_ref(scanners.begin(), scanners.end()),
           _num_parallel_instances(num_parallel_instances) {
-    // Use the task exec context as a lock between scanner threads and fragment exection threads
-    _task_exec_ctx = _state->get_task_execution_context();
+    DCHECK(_output_row_descriptor == nullptr ||
+           _output_row_descriptor->tuple_descriptors().size() == 1);
     _query_id = _state->get_query_ctx()->query_id();
     ctx_id = UniqueId::gen_uid().to_string();
     if (_scanners.empty()) {
@@ -247,6 +257,9 @@ void ScannerContext::append_blocks_to_queue(std::vector<vectorized::BlockUPtr>& 
         _blocks_queue.push_back(std::move(b));
     }
     blocks.clear();
+    if (_dependency) {
+        _dependency->set_ready();
+    }
     _blocks_queue_added_cv.notify_one();
     _queued_blocks_memory_usage->add(_cur_bytes_in_queue - old_bytes_in_queue);
 }

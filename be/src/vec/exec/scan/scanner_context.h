@@ -65,11 +65,13 @@ class SimplifiedScanScheduler;
 // ScannerContext is also the scheduling unit of ScannerScheduler.
 // ScannerScheduler schedules a ScannerContext at a time,
 // and submits the Scanners to the scanner thread pool for data scanning.
-class ScannerContext : public std::enable_shared_from_this<ScannerContext> {
+class ScannerContext : public std::enable_shared_from_this<ScannerContext>,
+                       public HasTaskExecutionCtx {
     ENABLE_FACTORY_CREATOR(ScannerContext);
 
 public:
     ScannerContext(RuntimeState* state, VScanNode* parent, const TupleDescriptor* output_tuple_desc,
+                   const RowDescriptor* output_row_descriptor,
                    const std::list<VScannerSPtr>& scanners, int64_t limit_,
                    int64_t max_bytes_in_blocks_queue, const int num_parallel_instances = 1,
                    pipeline::ScanLocalStateBase* local_state = nullptr);
@@ -169,7 +171,7 @@ public:
 
     SimplifiedScanScheduler* get_simple_scan_scheduler() { return _simple_scan_scheduler; }
 
-    void reschedule_scanner_ctx();
+    virtual void reschedule_scanner_ctx();
 
     // the unique id of this context
     std::string ctx_id;
@@ -179,14 +181,13 @@ public:
 
     bool _should_reset_thread_name = true;
 
-    std::weak_ptr<TaskExecutionContext> get_task_execution_context() { return _task_exec_ctx; }
-
 private:
     template <typename Parent>
     Status _close_and_clear_scanners(Parent* parent, RuntimeState* state);
 
 protected:
     ScannerContext(RuntimeState* state_, const TupleDescriptor* output_tuple_desc,
+                   const RowDescriptor* output_row_descriptor,
                    const std::list<VScannerSPtr>& scanners_, int64_t limit_,
                    int64_t max_bytes_in_blocks_queue_, const int num_parallel_instances,
                    pipeline::ScanLocalStateBase* local_state,
@@ -197,12 +198,12 @@ protected:
     void _set_scanner_done();
 
     RuntimeState* _state = nullptr;
-    std::weak_ptr<TaskExecutionContext> _task_exec_ctx;
     VScanNode* _parent = nullptr;
     pipeline::ScanLocalStateBase* _local_state = nullptr;
 
     // the comment of same fields in VScanNode
     const TupleDescriptor* _output_tuple_desc = nullptr;
+    const RowDescriptor* _output_row_descriptor = nullptr;
 
     // _transfer_lock is used to protect the critical section
     // where the ScanNode and ScannerScheduler interact.

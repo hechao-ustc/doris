@@ -20,38 +20,45 @@
 #include <gen_cpp/Types_types.h>
 #include <glog/logging.h>
 
-#include <atomic>
-#include <cstddef>
-#include <cstdint>
-#include <memory>
-#include <mutex>
-#include <shared_mutex>
-#include <vector>
-
 #include "client_cache.h"
 #include "common/config.h"
-#include "common/status.h"
-#include "olap/wal_manager.h"
 #include "runtime/exec_env.h"
 #include "runtime/fragment_mgr.h"
-#include "runtime/runtime_state.h"
 #include "util/thrift_rpc_helper.h"
-#include "vec/core/block.h"
 
 namespace doris {
 
-Status LoadBlockQueue::add_block(std::shared_ptr<vectorized::Block> block, bool write_wal) {
+Status LoadBlockQueue::add_block(RuntimeState* runtime_state,
+                                 std::shared_ptr<vectorized::Block> block, bool write_wal) {
     std::unique_lock l(mutex);
     RETURN_IF_ERROR(status);
-    while (_all_block_queues_bytes->load(std::memory_order_relaxed) >
-           config::group_commit_max_queue_size) {
+    auto start = std::chrono::steady_clock::now();
+    while (!runtime_state->is_cancelled() && status.ok() &&
+           _all_block_queues_bytes->load(std::memory_order_relaxed) >
+                   config::group_commit_queue_mem_limit) {
         _put_cond.wait_for(
                 l, std::chrono::milliseconds(LoadBlockQueue::MAX_BLOCK_QUEUE_ADD_WAIT_TIME));
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start);
+        if (duration.count() > LoadBlockQueue::WAL_MEM_BACK_PRESSURE_TIME_OUT) {
+            return Status::TimedOut(
+                    "Wal memory back pressure wait too much time! Load block queue txn id: {}, "
+                    "label: {}, instance id: {}",
+                    txn_id, label, load_instance_id.to_string());
+        }
     }
+    if (runtime_state->is_cancelled()) {
+        return Status::Cancelled(runtime_state->cancel_reason());
+    }
+    RETURN_IF_ERROR(status);
     if (block->rows() > 0) {
         _block_queue.push_back(block);
         if (write_wal) {
-            RETURN_IF_ERROR(_v_wal_writer->write_wal(block.get()));
+            auto st = _v_wal_writer->write_wal(block.get());
+            if (!st.ok()) {
+                _cancel_without_lock(st);
+                return st;
+            }
         }
         _all_block_queues_bytes->fetch_add(block->bytes(), std::memory_order_relaxed);
     }
@@ -231,6 +238,8 @@ Status GroupCommitTable::_create_group_commit_load(
     request.__set_token("group_commit"); // this is a fake, fe not check it now
     request.__set_max_filter_ratio(1.0);
     request.__set_strictMode(false);
+    // this is an internal interface, use admin to pass the auth check
+    request.__set_user("admin");
     if (_exec_env->master_info()->__isset.backend_id) {
         request.__set_backend_id(_exec_env->master_info()->backend_id);
     } else {
@@ -278,11 +287,17 @@ Status GroupCommitTable::_create_group_commit_load(
         _load_block_queues.emplace(instance_id, load_block_queue);
         _need_plan_fragment = false;
         _exec_env->wal_mgr()->add_wal_status_queue(_table_id, txn_id,
-                                                   WalManager::WAL_STATUS::PREPARE);
+                                                   WalManager::WalStatus::PREPARE);
         //create wal
-        RETURN_IF_ERROR(
-                load_block_queue->create_wal(_db_id, _table_id, txn_id, label, _exec_env->wal_mgr(),
-                                             params.desc_tbl.slotDescriptors, be_exe_version));
+        if (!is_pipeline) {
+            RETURN_IF_ERROR(load_block_queue->create_wal(
+                    _db_id, _table_id, txn_id, label, _exec_env->wal_mgr(),
+                    params.desc_tbl.slotDescriptors, be_exe_version));
+        } else {
+            RETURN_IF_ERROR(load_block_queue->create_wal(
+                    _db_id, _table_id, txn_id, label, _exec_env->wal_mgr(),
+                    pipeline_params.desc_tbl.slotDescriptors, be_exe_version));
+        }
         _cv.notify_all();
     }
     st = _exec_plan_fragment(_db_id, _table_id, label, txn_id, is_pipeline, params,
@@ -367,10 +382,8 @@ Status GroupCommitTable::_finish_group_commit_load(int64_t db_id, int64_t table_
     } else {
         std::string wal_path;
         RETURN_IF_ERROR(_exec_env->wal_mgr()->get_wal_path(txn_id, wal_path));
-        RETURN_IF_ERROR(_exec_env->wal_mgr()->add_recover_wal(db_id, table_id,
-                                                              std::vector<std::string> {wal_path}));
-        _exec_env->wal_mgr()->add_wal_status_queue(table_id, txn_id,
-                                                   WalManager::WAL_STATUS::REPLAY);
+        RETURN_IF_ERROR(_exec_env->wal_mgr()->add_recover_wal(db_id, table_id, txn_id, wal_path));
+        _exec_env->wal_mgr()->add_wal_status_queue(table_id, txn_id, WalManager::WalStatus::REPLAY);
     }
     std::stringstream ss;
     ss << "finish group commit, db_id=" << db_id << ", table_id=" << table_id << ", label=" << label
@@ -485,33 +498,17 @@ Status LoadBlockQueue::close_wal() {
     return Status::OK();
 }
 
-bool LoadBlockQueue::has_enough_wal_disk_space(
-        const std::vector<std::shared_ptr<vectorized::Block>>& blocks, const TUniqueId& load_id,
-        bool is_blocks_contain_all_load_data) {
-    size_t blocks_size = 0;
-    for (auto block : blocks) {
-        blocks_size += block->bytes();
-    }
-    size_t content_length = 0;
-    Status st = ExecEnv::GetInstance()->group_commit_mgr()->get_load_info(load_id, &content_length);
-    if (st.ok()) {
-        RETURN_IF_ERROR(ExecEnv::GetInstance()->group_commit_mgr()->remove_load_info(load_id));
-    } else {
-        return Status::InternalError("can not find load id.");
-    }
-    size_t pre_allocated = is_blocks_contain_all_load_data
-                                   ? blocks_size
-                                   : (blocks_size > content_length ? blocks_size : content_length);
+bool LoadBlockQueue::has_enough_wal_disk_space(size_t pre_allocated) {
     auto* wal_mgr = ExecEnv::GetInstance()->wal_mgr();
     size_t available_bytes = 0;
     {
-        st = wal_mgr->get_wal_dir_available_size(wal_base_path, &available_bytes);
+        Status st = wal_mgr->get_wal_dir_available_size(wal_base_path, &available_bytes);
         if (!st.ok()) {
             LOG(WARNING) << "get wal disk available size filed!";
         }
     }
     if (pre_allocated < available_bytes) {
-        st = wal_mgr->update_wal_dir_pre_allocated(wal_base_path, pre_allocated, true);
+        Status st = wal_mgr->update_wal_dir_pre_allocated(wal_base_path, pre_allocated, true);
         if (!st.ok()) {
             LOG(WARNING) << "update wal dir pre_allocated failed, reason: " << st.to_string();
         }
@@ -520,31 +517,5 @@ bool LoadBlockQueue::has_enough_wal_disk_space(
     } else {
         return false;
     }
-}
-
-Status GroupCommitMgr::update_load_info(TUniqueId load_id, size_t content_length) {
-    std::unique_lock l(_load_info_lock);
-    if (_load_id_to_content_length_map.find(load_id) == _load_id_to_content_length_map.end()) {
-        _load_id_to_content_length_map.insert(std::make_pair(load_id, content_length));
-    }
-    return Status::OK();
-}
-
-Status GroupCommitMgr::get_load_info(TUniqueId load_id, size_t* content_length) {
-    std::shared_lock l(_load_info_lock);
-    if (_load_id_to_content_length_map.find(load_id) != _load_id_to_content_length_map.end()) {
-        *content_length = _load_id_to_content_length_map[load_id];
-        return Status::OK();
-    }
-    return Status::InternalError("can not find load id!");
-}
-
-Status GroupCommitMgr::remove_load_info(TUniqueId load_id) {
-    std::unique_lock l(_load_info_lock);
-    if (_load_id_to_content_length_map.find(load_id) == _load_id_to_content_length_map.end()) {
-        return Status::InternalError("can not remove load id!");
-    }
-    _load_id_to_content_length_map.erase(load_id);
-    return Status::OK();
 }
 } // namespace doris
