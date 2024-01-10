@@ -270,6 +270,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
     public PlanFragment visitPhysicalDistribute(PhysicalDistribute<? extends Plan> distribute,
             PlanTranslatorContext context) {
         PlanFragment inputFragment = distribute.child().accept(this, context);
+        List<List<Expr>> distributeExprLists = getDistributeExprs(distribute.child());
         // TODO: why need set streaming here? should remove this.
         if (inputFragment.getPlanRoot() instanceof AggregationNode
                 && distribute.child() instanceof PhysicalHashAggregate
@@ -282,7 +283,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
             }
         }
 
-        ExchangeNode exchangeNode = new ExchangeNode(distribute.translatePlanNodeId(), inputFragment.getPlanRoot());
+        ExchangeNode exchangeNode = new ExchangeNode(context.nextPlanNodeId(), inputFragment.getPlanRoot());
         updateLegacyPlanIdToPhysicalPlan(exchangeNode, distribute);
         List<ExprId> validOutputIds = distribute.getOutputExprIds();
         if (distribute.child() instanceof PhysicalHashAggregate) {
@@ -315,6 +316,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         }
         DataPartition dataPartition = toDataPartition(distribute.getDistributionSpec(), validOutputIds, context);
         exchangeNode.setPartitionType(dataPartition.getType());
+        exchangeNode.setDistributeExprLists(distributeExprLists);
         PlanFragment parentFragment = new PlanFragment(context.nextFragmentId(), exchangeNode, dataPartition);
         if (distribute.getDistributionSpec() instanceof DistributionSpecGather) {
             // gather to one instance
@@ -461,13 +463,13 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         if (table instanceof HMSExternalTable) {
             switch (((HMSExternalTable) table).getDlaType()) {
                 case HUDI:
-                    scanNode = new HudiScanNode(fileScan.translatePlanNodeId(), tupleDescriptor, false);
+                    scanNode = new HudiScanNode(context.nextPlanNodeId(), tupleDescriptor, false);
                     break;
                 case ICEBERG:
-                    scanNode = new IcebergScanNode(fileScan.translatePlanNodeId(), tupleDescriptor, false);
+                    scanNode = new IcebergScanNode(context.nextPlanNodeId(), tupleDescriptor, false);
                     break;
                 case HIVE:
-                    scanNode = new HiveScanNode(fileScan.translatePlanNodeId(), tupleDescriptor, false);
+                    scanNode = new HiveScanNode(context.nextPlanNodeId(), tupleDescriptor, false);
                     HiveScanNode hiveScanNode = (HiveScanNode) scanNode;
                     hiveScanNode.setSelectedPartitions(fileScan.getSelectedPartitions());
                     if (fileScan.getTableSample().isPresent()) {
@@ -479,15 +481,15 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
                     throw new RuntimeException("do not support DLA type " + ((HMSExternalTable) table).getDlaType());
             }
         } else if (table instanceof IcebergExternalTable) {
-            scanNode = new IcebergScanNode(fileScan.translatePlanNodeId(), tupleDescriptor, false);
+            scanNode = new IcebergScanNode(context.nextPlanNodeId(), tupleDescriptor, false);
         } else if (table instanceof PaimonExternalTable) {
-            scanNode = new PaimonScanNode(fileScan.translatePlanNodeId(), tupleDescriptor, false);
+            scanNode = new PaimonScanNode(context.nextPlanNodeId(), tupleDescriptor, false);
         } else if (table instanceof MaxComputeExternalTable) {
-            scanNode = new MaxComputeScanNode(fileScan.translatePlanNodeId(), tupleDescriptor, false);
+            scanNode = new MaxComputeScanNode(context.nextPlanNodeId(), tupleDescriptor, false);
         } else {
             throw new RuntimeException("do not support table type " + table.getType());
         }
-
+        scanNode.setNereidsId(fileScan.getId());
         scanNode.addConjuncts(translateToLegacyConjuncts(fileScan.getConjuncts()));
         scanNode.setPushDownAggNoGrouping(context.getRelationPushAggOp(fileScan.getRelationId()));
 
@@ -526,8 +528,8 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
 
         ArrayList<TupleId> tupleIds = new ArrayList<>();
         tupleIds.add(tupleDescriptor.getId());
-        EmptySetNode emptySetNode = new EmptySetNode(emptyRelation.translatePlanNodeId(), tupleIds);
-
+        EmptySetNode emptySetNode = new EmptySetNode(context.nextPlanNodeId(), tupleIds);
+        emptySetNode.setNereidsId(emptyRelation.getId());
         PlanFragment planFragment = createPlanFragment(emptySetNode,
                 DataPartition.UNPARTITIONED, emptyRelation);
         context.addPlanFragment(planFragment);
@@ -540,7 +542,8 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         List<Slot> slots = esScan.getOutput();
         ExternalTable table = esScan.getTable();
         TupleDescriptor tupleDescriptor = generateTupleDesc(slots, table, context);
-        EsScanNode esScanNode = new EsScanNode(esScan.translatePlanNodeId(), tupleDescriptor, true);
+        EsScanNode esScanNode = new EsScanNode(context.nextPlanNodeId(), tupleDescriptor, true);
+        esScanNode.setNereidsId(esScan.getId());
         esScanNode.addConjuncts(translateToLegacyConjuncts(esScan.getConjuncts()));
         Utils.execWithUncheckedException(esScanNode::init);
         context.addScanNode(esScanNode);
@@ -562,8 +565,9 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         List<Slot> slots = jdbcScan.getOutput();
         TableIf table = jdbcScan.getTable();
         TupleDescriptor tupleDescriptor = generateTupleDesc(slots, table, context);
-        JdbcScanNode jdbcScanNode = new JdbcScanNode(jdbcScan.translatePlanNodeId(), tupleDescriptor,
+        JdbcScanNode jdbcScanNode = new JdbcScanNode(context.nextPlanNodeId(), tupleDescriptor,
                 table instanceof JdbcExternalTable);
+        jdbcScanNode.setNereidsId(jdbcScan.getId());
         jdbcScanNode.addConjuncts(translateToLegacyConjuncts(jdbcScan.getConjuncts()));
         Utils.execWithUncheckedException(jdbcScanNode::init);
         context.addScanNode(jdbcScanNode);
@@ -585,8 +589,9 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         List<Slot> slots = odbcScan.getOutput();
         TableIf table = odbcScan.getTable();
         TupleDescriptor tupleDescriptor = generateTupleDesc(slots, table, context);
-        OdbcScanNode odbcScanNode = new OdbcScanNode(odbcScan.translatePlanNodeId(), tupleDescriptor,
+        OdbcScanNode odbcScanNode = new OdbcScanNode(context.nextPlanNodeId(), tupleDescriptor,
                 (OdbcTable) table);
+        odbcScanNode.setNereidsId(odbcScan.getId());
         odbcScanNode.addConjuncts(translateToLegacyConjuncts(odbcScan.getConjuncts()));
         Utils.execWithUncheckedException(odbcScanNode::init);
         context.addScanNode(odbcScanNode);
@@ -613,7 +618,9 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         if (olapScan.getSelectedIndexId() != olapScan.getTable().getBaseIndexId()) {
             generateTupleDesc(olapScan.getBaseOutputs(), olapTable, context);
         }
-        OlapScanNode olapScanNode = new OlapScanNode(olapScan.translatePlanNodeId(), tupleDescriptor, "OlapScanNode");
+
+        OlapScanNode olapScanNode = new OlapScanNode(context.nextPlanNodeId(), tupleDescriptor, "OlapScanNode");
+        olapScanNode.setNereidsId(olapScan.getId());
         // TODO: move all node set cardinality into one place
         if (olapScan.getStats() != null) {
             // NOTICE: we should not set stats row count
@@ -643,7 +650,6 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         if (olapScan.getTableSample().isPresent()) {
             olapScanNode.setTableSample(new TableSample(olapScan.getTableSample().get().isPercent,
                     olapScan.getTableSample().get().sampleValue, olapScan.getTableSample().get().seek));
-            olapScanNode.computeSampleTabletIds();
         }
 
         // TODO:  remove this switch?
@@ -723,7 +729,8 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
             slotDescriptor.setIsNullable(slots.get(i).nullable());
         }
 
-        UnionNode unionNode = new UnionNode(oneRowRelation.translatePlanNodeId(), oneRowTuple.getId());
+        UnionNode unionNode = new UnionNode(context.nextPlanNodeId(), oneRowTuple.getId());
+        unionNode.setNereidsId(oneRowRelation.getId());
         unionNode.setCardinality(1L);
         unionNode.addConstExprList(legacyExprs);
         unionNode.finalizeForNereids(oneRowTuple.getSlots(), new ArrayList<>());
@@ -745,10 +752,11 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         SchemaScanNode scanNode = null;
         if (BackendPartitionedSchemaScanNode.isBackendPartitionedSchemaTable(
                 table.getName())) {
-            scanNode = new BackendPartitionedSchemaScanNode(schemaScan.translatePlanNodeId(), tupleDescriptor);
+            scanNode = new BackendPartitionedSchemaScanNode(context.nextPlanNodeId(), tupleDescriptor);
         } else {
-            scanNode = new SchemaScanNode(schemaScan.translatePlanNodeId(), tupleDescriptor);
+            scanNode = new SchemaScanNode(context.nextPlanNodeId(), tupleDescriptor);
         }
+        scanNode.setNereidsId(schemaScan.getId());
         SchemaScanNode finalScanNode = scanNode;
         context.getRuntimeTranslator().ifPresent(
                 runtimeFilterGenerator -> runtimeFilterGenerator.getContext().getTargetListByScan(schemaScan)
@@ -770,7 +778,8 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         TupleDescriptor tupleDescriptor = generateTupleDesc(slots, tvfRelation.getFunction().getTable(), context);
 
         TableValuedFunctionIf catalogFunction = tvfRelation.getFunction().getCatalogFunction();
-        ScanNode scanNode = catalogFunction.getScanNode(tvfRelation.translatePlanNodeId(), tupleDescriptor);
+        ScanNode scanNode = catalogFunction.getScanNode(context.nextPlanNodeId(), tupleDescriptor);
+        scanNode.setNereidsId(tvfRelation.getId());
         Utils.execWithUncheckedException(scanNode::init);
         context.getRuntimeTranslator().ifPresent(
                 runtimeFilterGenerator -> runtimeFilterGenerator.getContext().getTargetListByScan(tvfRelation)
@@ -808,6 +817,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
             PlanTranslatorContext context) {
 
         PlanFragment inputPlanFragment = aggregate.child(0).accept(this, context);
+        List<List<Expr>> distributeExprLists = getDistributeExprs(aggregate.child(0));
 
         List<Expression> groupByExpressions = aggregate.getGroupByExpressions();
         List<NamedExpression> outputExpressions = aggregate.getOutputExpressions();
@@ -848,8 +858,12 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         boolean isPartial = aggregate.getAggregateParam().aggMode.productAggregateBuffer;
         AggregateInfo aggInfo = AggregateInfo.create(execGroupingExpressions, execAggregateFunctions,
                 aggFunOutputIds, isPartial, outputTupleDesc, outputTupleDesc, aggregate.getAggPhase().toExec());
-        AggregationNode aggregationNode = new AggregationNode(aggregate.translatePlanNodeId(),
+        AggregationNode aggregationNode = new AggregationNode(context.nextPlanNodeId(),
                 inputPlanFragment.getPlanRoot(), aggInfo);
+
+        aggregationNode.setDistributeExprLists(distributeExprLists);
+
+        aggregationNode.setNereidsId(aggregate.getId());
         if (!aggregate.getAggMode().isFinalPhase) {
             aggregationNode.unsetNeedsFinalize();
         }
@@ -942,10 +956,13 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
     public PlanFragment visitPhysicalAssertNumRows(PhysicalAssertNumRows<? extends Plan> assertNumRows,
             PlanTranslatorContext context) {
         PlanFragment currentFragment = assertNumRows.child().accept(this, context);
+        List<List<Expr>> distributeExprLists = getDistributeExprs(assertNumRows.child());
         // create assertNode
-        AssertNumRowsNode assertNumRowsNode = new AssertNumRowsNode(assertNumRows.translatePlanNodeId(),
+        AssertNumRowsNode assertNumRowsNode = new AssertNumRowsNode(context.nextPlanNodeId(),
                 currentFragment.getPlanRoot(),
                 ExpressionTranslator.translateAssert(assertNumRows.getAssertNumRowsElement()));
+        assertNumRowsNode.setDistributeExprLists(distributeExprLists);
+        assertNumRowsNode.setNereidsId(assertNumRows.getId());
         addPlanRoot(currentFragment, assertNumRowsNode, assertNumRows);
         return currentFragment;
     }
@@ -1047,7 +1064,8 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         PlanNode planNode = inputFragment.getPlanRoot();
         if (planNode instanceof ExchangeNode || planNode instanceof SortNode || planNode instanceof UnionNode) {
             // the three nodes don't support conjuncts, need create a SelectNode to filter data
-            SelectNode selectNode = new SelectNode(filter.translatePlanNodeId(), planNode);
+            SelectNode selectNode = new SelectNode(context.nextPlanNodeId(), planNode);
+            selectNode.setNereidsId(filter.getId());
             addConjunctsToPlanNode(filter, selectNode, context);
             addPlanRoot(inputFragment, selectNode, filter);
         } else {
@@ -1081,8 +1099,9 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
                 .flatMap(List::stream)
                 .map(SlotDescriptor::getId)
                 .collect(Collectors.toList());
-        TableFunctionNode tableFunctionNode = new TableFunctionNode(generate.translatePlanNodeId(),
+        TableFunctionNode tableFunctionNode = new TableFunctionNode(context.nextPlanNodeId(),
                 currentFragment.getPlanRoot(), tupleDescriptor.getId(), functionCalls, outputSlotIds);
+        tableFunctionNode.setNereidsId(generate.getId());
         addPlanRoot(currentFragment, tableFunctionNode, generate);
         return currentFragment;
     }
@@ -1144,6 +1163,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         // NOTICE: We must visit from right to left, to ensure the last fragment is root fragment
         PlanFragment rightFragment = hashJoin.child(1).accept(this, context);
         PlanFragment leftFragment = hashJoin.child(0).accept(this, context);
+        List<List<Expr>> distributeExprLists = getDistributeExprs(physicalHashJoin.left(), physicalHashJoin.right());
 
         if (JoinUtils.shouldNestedLoopJoin(hashJoin)) {
             throw new RuntimeException("Physical hash join could not execute without equal join condition.");
@@ -1159,10 +1179,11 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
                 .map(e -> ExpressionTranslator.translate(e, context))
                 .collect(Collectors.toList());
 
-        HashJoinNode hashJoinNode = new HashJoinNode(hashJoin.translatePlanNodeId(), leftPlanRoot,
+        HashJoinNode hashJoinNode = new HashJoinNode(context.nextPlanNodeId(), leftPlanRoot,
                 rightPlanRoot, JoinType.toJoinOperator(joinType), execEqConjuncts, Lists.newArrayList(),
                 null, null, null, hashJoin.isMarkJoin());
-
+        hashJoinNode.setNereidsId(hashJoin.getId());
+        hashJoinNode.setDistributeExprLists(distributeExprLists);
         PlanFragment currentFragment = connectJoinNode(hashJoinNode, leftFragment, rightFragment, context, hashJoin);
 
         if (joinType == JoinType.NULL_AWARE_LEFT_ANTI_JOIN) {
@@ -1184,6 +1205,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         } else {
             hashJoinNode.setDistributionMode(DistributionMode.PARTITIONED);
         }
+
         // Nereids does not care about output order of join,
         // but BE need left child's output must be before right child's output.
         // So we need to swap the output order of left and right child if necessary.
@@ -1395,6 +1417,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         //       PhysicalPlan plan, PlanVisitor visitor, Context context).
         PlanFragment rightFragment = nestedLoopJoin.child(1).accept(this, context);
         PlanFragment leftFragment = nestedLoopJoin.child(0).accept(this, context);
+        List<List<Expr>> distributeExprLists = getDistributeExprs(nestedLoopJoin.child(0), nestedLoopJoin.child(1));
         PlanNode leftFragmentPlanRoot = leftFragment.getPlanRoot();
         PlanNode rightFragmentPlanRoot = rightFragment.getPlanRoot();
         if (JoinUtils.shouldNestedLoopJoin(nestedLoopJoin)) {
@@ -1405,9 +1428,12 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
                     .collect(Collectors.toList());
 
             JoinType joinType = nestedLoopJoin.getJoinType();
-            NestedLoopJoinNode nestedLoopJoinNode = new NestedLoopJoinNode(nestedLoopJoin.translatePlanNodeId(),
+
+            NestedLoopJoinNode nestedLoopJoinNode = new NestedLoopJoinNode(context.nextPlanNodeId(),
                     leftFragmentPlanRoot, rightFragmentPlanRoot, tupleIds, JoinType.toJoinOperator(joinType),
                     null, null, null, nestedLoopJoin.isMarkJoin());
+            nestedLoopJoinNode.setNereidsId(nestedLoopJoin.getId());
+            nestedLoopJoinNode.setDistributeExprLists(distributeExprLists);
             if (nestedLoopJoin.getStats() != null) {
                 nestedLoopJoinNode.setCardinality((long) nestedLoopJoin.getStats().getRowCount());
             }
@@ -1574,8 +1600,10 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
     public PlanFragment visitPhysicalPartitionTopN(PhysicalPartitionTopN<? extends Plan> partitionTopN,
             PlanTranslatorContext context) {
         PlanFragment inputFragment = partitionTopN.child(0).accept(this, context);
+        List<List<Expr>> distributeExprLists = getDistributeExprs(partitionTopN.child(0));
         PartitionSortNode partitionSortNode = translatePartitionSortNode(
                 partitionTopN, inputFragment.getPlanRoot(), context);
+        partitionSortNode.setDistributeExprLists(distributeExprLists);
         addPlanRoot(inputFragment, partitionSortNode, partitionTopN);
         // in pipeline engine, we use parallel scan by default, but it broke the rule of data distribution
         // we need turn of parallel scan to ensure to get correct result.
@@ -1739,14 +1767,15 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         SetOperationNode setOperationNode;
         // create setOperationNode
         if (setOperation instanceof PhysicalUnion) {
-            setOperationNode = new UnionNode(setOperation.translatePlanNodeId(), setTuple.getId());
+            setOperationNode = new UnionNode(context.nextPlanNodeId(), setTuple.getId());
         } else if (setOperation instanceof PhysicalExcept) {
-            setOperationNode = new ExceptNode(setOperation.translatePlanNodeId(), setTuple.getId());
+            setOperationNode = new ExceptNode(context.nextPlanNodeId(), setTuple.getId());
         } else if (setOperation instanceof PhysicalIntersect) {
-            setOperationNode = new IntersectNode(setOperation.translatePlanNodeId(), setTuple.getId());
+            setOperationNode = new IntersectNode(context.nextPlanNodeId(), setTuple.getId());
         } else {
             throw new RuntimeException("not support set operation type " + setOperation);
         }
+        setOperationNode.setNereidsId(setOperation.getId());
 
         setOperation.getRegularChildrenOutputs().stream()
                 .map(o -> o.stream()
@@ -1819,11 +1848,13 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
     public PlanFragment visitPhysicalQuickSort(PhysicalQuickSort<? extends Plan> sort,
             PlanTranslatorContext context) {
         PlanFragment inputFragment = sort.child(0).accept(this, context);
+        List<List<Expr>> distributeExprLists = getDistributeExprs(sort.child(0));
 
         // 2. According to the type of sort, generate physical plan
         if (!sort.getSortPhase().isMerge()) {
             // For localSort or Gather->Sort, we just need to add sortNode
             SortNode sortNode = translateSortNode(sort, inputFragment.getPlanRoot(), context);
+            sortNode.setDistributeExprLists(distributeExprLists);
             addPlanRoot(inputFragment, sortNode, sort);
         } else {
             // For mergeSort, we need to push sortInfo to exchangeNode
@@ -1836,6 +1867,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
             SortNode sortNode = (SortNode) inputFragment.getPlanRoot().getChild(0);
             ((ExchangeNode) inputFragment.getPlanRoot()).setMergeInfo(sortNode.getSortInfo());
             sortNode.setMergeByExchange();
+            sortNode.setDistributeExprLists(distributeExprLists);
         }
         return inputFragment;
     }
@@ -1843,6 +1875,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
     @Override
     public PlanFragment visitPhysicalTopN(PhysicalTopN<? extends Plan> topN, PlanTranslatorContext context) {
         PlanFragment inputFragment = topN.child(0).accept(this, context);
+        List<List<Expr>> distributeExprLists = getDistributeExprs(topN.child(0));
 
         // 2. According to the type of sort, generate physical plan
         if (!topN.getSortPhase().isMerge()) {
@@ -1875,6 +1908,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
                     }
                 }
             }
+            sortNode.setDistributeExprLists(distributeExprLists);
             addPlanRoot(inputFragment, sortNode, topN);
         } else {
             // For mergeSort, we need to push sortInfo to exchangeNode
@@ -1887,6 +1921,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
                 return inputFragment;
             }
             ExchangeNode exchangeNode = (ExchangeNode) inputFragment.getPlanRoot();
+            exchangeNode.setDistributeExprLists(distributeExprLists);
             exchangeNode.setMergeInfo(((SortNode) exchangeNode.getChild(0)).getSortInfo());
             exchangeNode.setLimit(topN.getLimit());
             exchangeNode.setOffset(topN.getOffset());
@@ -1919,6 +1954,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
     @Override
     public PlanFragment visitPhysicalRepeat(PhysicalRepeat<? extends Plan> repeat, PlanTranslatorContext context) {
         PlanFragment inputPlanFragment = repeat.child(0).accept(this, context);
+        List<List<Expr>> distributeExprLists = getDistributeExprs(repeat.child(0));
 
         Set<VirtualSlotReference> sortedVirtualSlots = repeat.getSortedVirtualSlots();
         TupleDescriptor virtualSlotsTuple =
@@ -1963,9 +1999,11 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
                 .flatMap(Set::stream)
                 .collect(ImmutableSet.toImmutableSet());
 
-        RepeatNode repeatNode = new RepeatNode(repeat.translatePlanNodeId(),
+        RepeatNode repeatNode = new RepeatNode(context.nextPlanNodeId(),
                 inputPlanFragment.getPlanRoot(), groupingInfo, repeatSlotIdList,
                 allSlotId, repeat.computeVirtualSlotValues(sortedVirtualSlots));
+        repeatNode.setNereidsId(repeat.getId());
+        repeatNode.setDistributeExprLists(distributeExprLists);
         addPlanRoot(inputPlanFragment, repeatNode, repeat);
         updateLegacyPlanIdToPhysicalPlan(inputPlanFragment.getPlanRoot(), repeat);
         return inputPlanFragment;
@@ -1975,6 +2013,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
     public PlanFragment visitPhysicalWindow(PhysicalWindow<? extends Plan> physicalWindow,
             PlanTranslatorContext context) {
         PlanFragment inputPlanFragment = physicalWindow.child(0).accept(this, context);
+        List<List<Expr>> distributeExprLists = getDistributeExprs(physicalWindow.child(0));
 
         // 1. translate to old optimizer variable
         // variable in Nereids
@@ -2038,7 +2077,7 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
 
         // 4. generate AnalyticEvalNode
         AnalyticEvalNode analyticEvalNode = new AnalyticEvalNode(
-                physicalWindow.translatePlanNodeId(),
+                context.nextPlanNodeId(),
                 inputPlanFragment.getPlanRoot(),
                 analyticFnCalls,
                 partitionExprs,
@@ -2050,6 +2089,12 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
                 orderElementsIsNullableMatched,
                 bufferedTupleDesc
         );
+        analyticEvalNode.setNereidsId(physicalWindow.getId());
+        analyticEvalNode.setDistributeExprLists(distributeExprLists);
+        PlanNode root = inputPlanFragment.getPlanRoot();
+        if (root instanceof SortNode) {
+            ((SortNode) root).setIsAnalyticSort(true);
+        }
         inputPlanFragment.addPlanRoot(analyticEvalNode);
 
         // in pipeline engine, we use parallel scan by default, but it broke the rule of data distribution
@@ -2058,6 +2103,9 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
         if (findOlapScanNodesByPassExchangeAndJoinNode(inputPlanFragment.getPlanRoot())) {
             inputPlanFragment.setHasColocatePlanNode(true);
             analyticEvalNode.setColocate(true);
+            if (root instanceof SortNode) {
+                ((SortNode) root).setColocate(true);
+            }
         }
         return inputPlanFragment;
     }
@@ -2083,9 +2131,10 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
             nullsFirstParams.add(k.isNullFirst());
         });
         SortInfo sortInfo = new SortInfo(orderingExprs, ascOrders, nullsFirstParams, sortTuple);
-        PartitionSortNode partitionSortNode = new PartitionSortNode(partitionTopN.translatePlanNodeId(), childNode,
+        PartitionSortNode partitionSortNode = new PartitionSortNode(context.nextPlanNodeId(), childNode,
                 partitionTopN.getFunction(), partitionExprs, sortInfo, partitionTopN.hasGlobalLimit(),
                 partitionTopN.getPartitionLimit(), partitionTopN.getPhase());
+        partitionSortNode.setNereidsId(partitionTopN.getId());
         if (partitionTopN.getStats() != null) {
             partitionSortNode.setCardinality((long) partitionTopN.getStats().getRowCount());
         }
@@ -2106,7 +2155,8 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
             nullsFirstParams.add(k.isNullFirst());
         });
         SortInfo sortInfo = new SortInfo(orderingExprs, ascOrders, nullsFirstParams, sortTuple);
-        SortNode sortNode = new SortNode(sort.translatePlanNodeId(), childNode, sortInfo, sort instanceof PhysicalTopN);
+        SortNode sortNode = new SortNode(context.nextPlanNodeId(), childNode, sortInfo, sort instanceof PhysicalTopN);
+        sortNode.setNereidsId(sort.getId());
         if (sort.getStats() != null) {
             sortNode.setCardinality((long) sort.getStats().getRowCount());
         }
@@ -2447,5 +2497,32 @@ public class PhysicalPlanTranslator extends DefaultPlanVisitor<PlanFragment, Pla
             return root.getChildren().stream().anyMatch(child -> findOlapScanNodesByPassExchangeAndJoinNode(child));
         }
         return false;
+    }
+
+    private List<List<Expr>> getDistributeExprs(Plan ... children) {
+        List<List<Expr>> distributeExprLists = Lists.newArrayList();
+        for (Plan child : children) {
+            DistributionSpec spec = ((PhysicalPlan) child).getPhysicalProperties().getDistributionSpec();
+            distributeExprLists.add(getDistributeExpr(child.getOutputExprIds(), spec));
+        }
+        return distributeExprLists;
+    }
+
+    private List<Expr> getDistributeExpr(List<ExprId> childOutputIds, DistributionSpec spec) {
+        if (spec instanceof DistributionSpecHash) {
+            DistributionSpecHash distributionSpecHash = (DistributionSpecHash) spec;
+            List<Expr> partitionExprs = Lists.newArrayList();
+            for (int i = 0; i < distributionSpecHash.getEquivalenceExprIds().size(); i++) {
+                Set<ExprId> equivalenceExprId = distributionSpecHash.getEquivalenceExprIds().get(i);
+                for (ExprId exprId : equivalenceExprId) {
+                    if (childOutputIds.contains(exprId)) {
+                        partitionExprs.add(context.findSlotRef(exprId));
+                        break;
+                    }
+                }
+            }
+            return partitionExprs;
+        }
+        return Lists.newArrayList();
     }
 }

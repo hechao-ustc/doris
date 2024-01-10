@@ -408,6 +408,10 @@ public class Coordinator implements CoordInterface {
         return scanRangeNum;
     }
 
+    public TQueryOptions getQueryOptions() {
+        return this.queryOptions;
+    }
+
     public void setQueryId(TUniqueId queryId) {
         this.queryId = queryId;
     }
@@ -684,6 +688,12 @@ public class Coordinator implements CoordInterface {
         } else {
             executionProfile.markInstances(instanceIds);
         }
+        StringBuilder ids = new StringBuilder();
+        for (TUniqueId instanceId : instanceIds) {
+            ids.append(DebugUtil.printId(instanceId));
+            ids.append(", ");
+        }
+        LOG.info("mark instances: {}", ids.toString());
 
         if (enablePipelineEngine) {
             sendPipelineCtx();
@@ -2034,9 +2044,10 @@ public class Coordinator implements CoordInterface {
                         boolean sharedScan = true;
                         int expectedInstanceNum = Math.min(parallelExecInstanceNum,
                                 leftMostNode.getNumInstances());
+                        boolean ignoreStorageDataDistribution = scanNodes.stream()
+                                .allMatch(scanNode -> scanNode.ignoreStorageDataDistribution(context)) && useNereids;
                         if (node.isPresent() && (!node.get().shouldDisableSharedScan(context)
-                                || (node.get().ignoreStorageDataDistribution(context)
-                                && expectedInstanceNum > perNodeScanRanges.size() && useNereids))) {
+                                || ignoreStorageDataDistribution)) {
                             expectedInstanceNum = Math.max(expectedInstanceNum, 1);
                             // if have limit and conjunts, only need 1 instance to save cpu and
                             // mem resource
@@ -2477,7 +2488,7 @@ public class Coordinator implements CoordInterface {
 
             Preconditions.checkArgument(params.isSetDetailedReport());
             if (ctx.done) {
-                LOG.debug("Query {} fragment {} is marked done",
+                LOG.info("Query {} fragment {} is marked done",
                         DebugUtil.printId(queryId), ctx.profileFragmentId);
                 executionProfile.markOneFragmentDone(ctx.profileFragmentId);
             }
@@ -2528,11 +2539,11 @@ public class Coordinator implements CoordInterface {
                 if (params.isSetErrorTabletInfos()) {
                     updateErrorTabletInfos(params.getErrorTabletInfos());
                 }
-                LOG.debug("Query {} instance {} is marked done",
+                LOG.info("Query {} instance {} is marked done",
                         DebugUtil.printId(queryId), DebugUtil.printId(params.getFragmentInstanceId()));
                 executionProfile.markOneInstanceDone(params.getFragmentInstanceId());
             } else {
-                LOG.debug("Query {} instance {} is not marked done",
+                LOG.info("Query {} instance {} is not marked done",
                         DebugUtil.printId(queryId), DebugUtil.printId(params.getFragmentInstanceId()));
             }
         } else {
@@ -2593,6 +2604,8 @@ public class Coordinator implements CoordInterface {
                 if (params.isSetErrorTabletInfos()) {
                     updateErrorTabletInfos(params.getErrorTabletInfos());
                 }
+                LOG.info("Query {} instance {} is marked done",
+                        DebugUtil.printId(queryId), DebugUtil.printId(params.getFragmentInstanceId()));
                 executionProfile.markOneInstanceDone(params.getFragmentInstanceId());
             }
         }
@@ -2894,9 +2907,8 @@ public class Coordinator implements CoordInterface {
          * 2. `parallelExecInstanceNum` is larger than scan ranges.
          * 3. Use Nereids planner.
          */
-        boolean ignoreStorageDataDistribution = scanNodes.stream().filter(scanNode -> {
-            return scanNodeIds.contains(scanNode.getId().asInt());
-        }).allMatch(node -> node.ignoreStorageDataDistribution(context))
+        boolean ignoreStorageDataDistribution = scanNodes.stream()
+                .allMatch(node -> node.ignoreStorageDataDistribution(context))
                 && addressToScanRanges.entrySet().stream().allMatch(addressScanRange -> {
                     return addressScanRange.getValue().size() < parallelExecInstanceNum;
                 }) && useNereids;
