@@ -25,6 +25,7 @@ import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.catalog.AggregateType;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.KeysType;
+import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.Pair;
@@ -261,6 +262,9 @@ import org.apache.doris.nereids.trees.expressions.functions.scalar.Array;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.ArraySlice;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.Char;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.ConvertTo;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.CurrentDate;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.CurrentTime;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.CurrentUser;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.DayCeil;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.DayFloor;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.DaysAdd;
@@ -284,6 +288,7 @@ import org.apache.doris.nereids.trees.expressions.functions.scalar.MonthFloor;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.MonthsAdd;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.MonthsDiff;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.MonthsSub;
+import org.apache.doris.nereids.trees.expressions.functions.scalar.Now;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.SecondCeil;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.SecondFloor;
 import org.apache.doris.nereids.trees.expressions.functions.scalar.SecondsAdd;
@@ -316,6 +321,7 @@ import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.nereids.trees.expressions.literal.MapLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.NullLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.SmallIntLiteral;
+import org.apache.doris.nereids.trees.expressions.literal.StringLikeLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.StringLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.StructLiteral;
 import org.apache.doris.nereids.trees.expressions.literal.TinyIntLiteral;
@@ -406,6 +412,7 @@ import org.apache.doris.nereids.types.VarcharType;
 import org.apache.doris.nereids.types.coercion.CharacterType;
 import org.apache.doris.nereids.util.ExpressionUtils;
 import org.apache.doris.nereids.util.RelationUtil;
+import org.apache.doris.nereids.util.Utils;
 import org.apache.doris.policy.FilterType;
 import org.apache.doris.policy.PolicyTypeEnum;
 import org.apache.doris.qe.ConnectContext;
@@ -432,7 +439,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
@@ -752,14 +758,14 @@ public class LogicalPlanBuilder extends DorisParserBaseVisitor<Object> {
 
     @Override
     public LogicalPlan visitShowConstraint(ShowConstraintContext ctx) {
-        Set<UnboundRelation> unboundRelation = visitRelation(ctx.table)
-                .collect(UnboundRelation.class::isInstance);
-        return new ShowConstraintsCommand(unboundRelation.iterator().next().getNameParts());
+        List<String> parts = visitMultipartIdentifier(ctx.table);
+        return new ShowConstraintsCommand(parts);
     }
 
     @Override
     public LogicalPlan visitAddConstraint(AddConstraintContext ctx) {
-        LogicalPlan curTable = visitRelation(ctx.table);
+        List<String> parts = visitMultipartIdentifier(ctx.table);
+        UnboundRelation curTable = new UnboundRelation(StatementScopeIdGenerator.newRelationId(), parts);
         ImmutableList<Slot> slots = visitIdentifierList(ctx.constraint().slots).stream()
                 .map(UnboundSlot::new)
                 .collect(ImmutableList.toImmutableList());
@@ -783,7 +789,8 @@ public class LogicalPlanBuilder extends DorisParserBaseVisitor<Object> {
 
     @Override
     public LogicalPlan visitDropConstraint(DropConstraintContext ctx) {
-        LogicalPlan curTable = visitRelation(ctx.table);
+        List<String> parts = visitMultipartIdentifier(ctx.table);
+        UnboundRelation curTable = new UnboundRelation(StatementScopeIdGenerator.newRelationId(), parts);
         return new DropConstraintCommand(ctx.constraintName.getText().toLowerCase(), curTable);
     }
 
@@ -1245,6 +1252,11 @@ public class LogicalPlanBuilder extends DorisParserBaseVisitor<Object> {
             }
         }
 
+        Optional<String> indexName = Optional.empty();
+        if (ctx.materializedViewName() != null) {
+            indexName = Optional.ofNullable(ctx.materializedViewName().indexName.getText());
+        }
+
         List<Long> tabletIdLists = new ArrayList<>();
         if (ctx.tabletList() != null) {
             ctx.tabletList().tabletIdList.stream().forEach(tabletToken -> {
@@ -1263,7 +1275,7 @@ public class LogicalPlanBuilder extends DorisParserBaseVisitor<Object> {
         LogicalPlan checkedRelation = LogicalPlanBuilderAssistant.withCheckPolicy(
                 new UnboundRelation(StatementScopeIdGenerator.newRelationId(),
                         tableId, partitionNames, isTempPart, tabletIdLists, relationHints,
-                        Optional.ofNullable(tableSample)));
+                        Optional.ofNullable(tableSample), indexName));
         LogicalPlan plan = withTableAlias(checkedRelation, ctx.tableAlias());
         for (LateralViewContext lateralViewContext : ctx.lateralView()) {
             plan = withGenerate(plan, lateralViewContext);
@@ -1744,6 +1756,36 @@ public class LogicalPlanBuilder extends DorisParserBaseVisitor<Object> {
     }
 
     @Override
+    public Expression visitCurrentDate(DorisParser.CurrentDateContext ctx) {
+        return new CurrentDate().alias("CURRENT_DATE");
+    }
+
+    @Override
+    public Expression visitCurrentTime(DorisParser.CurrentTimeContext ctx) {
+        return new CurrentTime().alias("CURRENT_TIME");
+    }
+
+    @Override
+    public Expression visitCurrentTimestamp(DorisParser.CurrentTimestampContext ctx) {
+        return new Now().alias("CURRENT_TIMESTAMP");
+    }
+
+    @Override
+    public Expression visitLocalTime(DorisParser.LocalTimeContext ctx) {
+        return new CurrentTime().alias("LOCALTIME");
+    }
+
+    @Override
+    public Expression visitLocalTimestamp(DorisParser.LocalTimestampContext ctx) {
+        return new Now().alias("LOCALTIMESTAMP");
+    }
+
+    @Override
+    public Expression visitCurrentUser(DorisParser.CurrentUserContext ctx) {
+        return new CurrentUser().alias("CURRENT_USER");
+    }
+
+    @Override
     public Expression visitDoublePipes(DorisParser.DoublePipesContext ctx) {
         return ParserUtils.withOrigin(ctx, () -> {
             Expression left = getExpression(ctx.left);
@@ -2104,7 +2146,11 @@ public class LogicalPlanBuilder extends DorisParserBaseVisitor<Object> {
         if (!SqlModeHelper.hasNoBackSlashEscapes()) {
             s = LogicalPlanBuilderAssistant.escapeBackSlash(s);
         }
-        return new VarcharLiteral(s);
+        int strLength = Utils.containChinese(s) ? s.length() * StringLikeLiteral.CHINESE_CHAR_BYTE_LENGTH : s.length();
+        if (strLength > ScalarType.MAX_VARCHAR_LENGTH) {
+            return new StringLiteral(s);
+        }
+        return new VarcharLiteral(s, strLength);
     }
 
     /**

@@ -211,7 +211,7 @@ import org.apache.doris.task.SnapshotTask;
 import org.apache.doris.thrift.TCheckStorageFormatResult;
 import org.apache.doris.thrift.TTaskType;
 import org.apache.doris.thrift.TUnit;
-import org.apache.doris.transaction.GlobalTransactionMgr;
+import org.apache.doris.transaction.GlobalTransactionMgrIface;
 import org.apache.doris.transaction.TransactionStatus;
 
 import com.google.common.base.Preconditions;
@@ -242,6 +242,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -1016,7 +1017,9 @@ public class ShowExecutor {
     private void handleShowColumn() throws AnalysisException {
         ShowColumnStmt showStmt = (ShowColumnStmt) stmt;
         List<List<String>> rows = Lists.newArrayList();
-        DatabaseIf db = Env.getCurrentEnv().getInternalCatalog().getDbOrAnalysisException(showStmt.getDb());
+        String ctl = showStmt.getCtl();
+        DatabaseIf db = Env.getCurrentEnv().getCatalogMgr().getCatalogOrAnalysisException(ctl)
+                .getDbOrAnalysisException(showStmt.getDb());
         TableIf table = db.getTableOrAnalysisException(showStmt.getTable());
         PatternMatcher matcher = null;
         if (showStmt.getPattern() != null) {
@@ -1031,7 +1034,7 @@ public class ShowExecutor {
                     continue;
                 }
                 final String columnName = col.getName();
-                final String columnType = col.getOriginType().toString();
+                final String columnType = col.getOriginType().toString().toLowerCase(Locale.ROOT);
                 final String isAllowNull = col.isAllowNull() ? "YES" : "NO";
                 final String isKey = col.isKey() ? "YES" : "NO";
                 final String defaultValue = col.getDefaultValue();
@@ -1068,18 +1071,23 @@ public class ShowExecutor {
     private void handleShowIndex() throws AnalysisException {
         ShowIndexStmt showStmt = (ShowIndexStmt) stmt;
         List<List<String>> rows = Lists.newArrayList();
-        DatabaseIf db = ctx.getCurrentCatalog().getDbOrAnalysisException(showStmt.getDbName());
-        OlapTable table = db.getOlapTableOrAnalysisException(showStmt.getTableName().getTbl());
-        table.readLock();
-        try {
-            List<Index> indexes = table.getIndexes();
-            for (Index index : indexes) {
-                rows.add(Lists.newArrayList(showStmt.getTableName().toString(), "", index.getIndexName(),
-                        "", String.join(",", index.getColumns()), "", "", "", "",
-                        "", index.getIndexType().name(), index.getComment(), index.getPropertiesString()));
+        DatabaseIf db = Env.getCurrentEnv().getCatalogMgr()
+                .getCatalogOrAnalysisException(showStmt.getTableName().getCtl())
+                .getDbOrAnalysisException(showStmt.getDbName());
+        if (db instanceof Database) {
+            OlapTable table = db.getOlapTableOrAnalysisException(showStmt.getTableName().getTbl());
+            table.readLock();
+            try {
+                List<Index> indexes = table.getIndexes();
+                for (Index index : indexes) {
+                    rows.add(Lists.newArrayList(showStmt.getTableName().toString(), "", index.getIndexName(),
+                            "", String.join(",", index.getColumns()), "", "", "", "",
+                            "", index.getIndexType().name(), index.getComment(), index.getPropertiesString(),
+                            String.valueOf(index.getIndexId())));
+                }
+            } finally {
+                table.readUnlock();
             }
-        } finally {
-            table.readUnlock();
         }
         resultSet = new ShowResultSet(showStmt.getMetaData(), rows);
     }
@@ -1908,10 +1916,16 @@ public class ShowExecutor {
     }
 
     // Handle show resources
-    private void handleShowResources() {
+    private void handleShowResources() throws AnalysisException {
         ShowResourcesStmt showStmt = (ShowResourcesStmt) stmt;
+        PatternMatcher matcher = null;
+        if (showStmt.getPattern() != null) {
+            matcher = PatternMatcherWrapper.createMysqlPattern(showStmt.getPattern(),
+                    CaseSensibility.RESOURCE.getCaseSensibility());
+        }
+
         List<List<Comparable>> resourcesInfos = Env.getCurrentEnv().getResourceMgr()
-                .getResourcesInfo(showStmt.getNameValue(), showStmt.isAccurateMatch(), showStmt.getTypeSet());
+                .getResourcesInfo(matcher, showStmt.getNameValue(), showStmt.isAccurateMatch(), showStmt.getTypeSet());
 
         // order the result of List<LoadInfo> by orderByPairs in show stmt
         List<OrderByPair> orderByPairs = showStmt.getOrderByPairs();
@@ -1952,10 +1966,14 @@ public class ShowExecutor {
         resultSet = new ShowResultSet(showStmt.getMetaData(), rows);
     }
 
-    private void handleShowWorkloadGroups() {
+    private void handleShowWorkloadGroups() throws AnalysisException {
         ShowWorkloadGroupsStmt showStmt = (ShowWorkloadGroupsStmt) stmt;
-        List<List<String>> workloadGroupsInfos = Env.getCurrentEnv().getWorkloadGroupMgr().getResourcesInfo();
-
+        PatternMatcher matcher = null;
+        if (showStmt.getPattern() != null) {
+            matcher = PatternMatcherWrapper.createMysqlPattern(showStmt.getPattern(),
+                    CaseSensibility.WORKLOAD_GROUP.getCaseSensibility());
+        }
+        List<List<String>> workloadGroupsInfos = Env.getCurrentEnv().getWorkloadGroupMgr().getResourcesInfo(matcher);
         resultSet = new ShowResultSet(showStmt.getMetaData(), workloadGroupsInfos);
     }
 
@@ -2228,10 +2246,13 @@ public class ShowExecutor {
         DatabaseIf db = ctx.getEnv().getInternalCatalog().getDbOrAnalysisException(showStmt.getDbName());
 
         TransactionStatus status = showStmt.getStatus();
-        GlobalTransactionMgr transactionMgr = Env.getCurrentGlobalTransactionMgr();
+        GlobalTransactionMgrIface transactionMgr = Env.getCurrentGlobalTransactionMgr();
         if (status != TransactionStatus.UNKNOWN) {
             resultSet = new ShowResultSet(showStmt.getMetaData(),
                     transactionMgr.getDbTransInfoByStatus(db.getId(), status));
+        } else if (showStmt.labelMatch() && !showStmt.getLabel().isEmpty()) {
+            resultSet =  new ShowResultSet(showStmt.getMetaData(),
+                transactionMgr.getDbTransInfoByLabelMatch(db.getId(), showStmt.getLabel()));
         } else {
             Long txnId = showStmt.getTxnId();
             String label = showStmt.getLabel();
