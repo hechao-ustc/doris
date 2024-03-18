@@ -79,9 +79,8 @@ public class BindSlotWithPaths implements AnalysisRuleFactory {
                                 return ctx.root;
                             }
                             newProjectsExpr.addAll(newExprs);
-                            return new LogicalProject(newProjectsExpr, logicalOlapScan.withProjectPulledUp());
+                            return new LogicalProject<>(newProjectsExpr, logicalOlapScan.withProjectPulledUp());
                         }))
         );
     }
 }
-

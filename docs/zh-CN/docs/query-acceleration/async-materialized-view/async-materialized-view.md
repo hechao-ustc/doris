@@ -52,9 +52,9 @@ CREATE TABLE IF NOT EXISTS orders  (
     PROPERTIES ("replication_num" = "1");
 
 insert into orders values
-   (1, 1, 'ok', 99.5, '2023-10-17', 'a', 'b', 1, 'yy'),
-   (2, 2, 'ok', 109.2, '2023-10-18', 'c','d',2, 'mm'),
-   (3, 3, 'ok', 99.5, '2023-10-19', 'a', 'b', 1, 'yy');
+   (1, 1, 'o', 99.5, '2023-10-17', 'a', 'b', 1, 'yy'),
+   (2, 2, 'o', 109.2, '2023-10-18', 'c','d',2, 'mm'),
+   (3, 3, 'o', 99.5, '2023-10-19', 'a', 'b', 1, 'yy');
 
 CREATE TABLE IF NOT EXISTS lineitem (
     l_orderkey    integer not null,
@@ -206,4 +206,9 @@ DROP MATERIALIZED VIEW mv1;
 ## 物化视图的使用
 
 请参阅 [查询异步物化视图](./query-async-materialized-view.md)
+
+## 注意事项
+
+- 异步物化视图仅支持在Nereids优化器使用，[Nereids优化器](../nereids.md)
+- 当前判断物化视图和基表是否同步仅支持`OlapTable`。对于其它外表，会直接认为是同步的。例如，物化视图的基表全是外表。在查询`mv_infos()`时，SyncWithBaseTables会永远为1（true）。在刷新物化视图时需要手动刷新指定的分区或指定`complete`刷新全部分区
 

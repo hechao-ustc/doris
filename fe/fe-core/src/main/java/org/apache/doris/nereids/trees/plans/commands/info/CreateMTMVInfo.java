@@ -17,6 +17,7 @@
 
 package org.apache.doris.nereids.trees.plans.commands.info;
 
+import org.apache.doris.analysis.AllPartitionDesc;
 import org.apache.doris.analysis.CreateMTMVStmt;
 import org.apache.doris.analysis.KeysDesc;
 import org.apache.doris.analysis.ListPartitionDesc;
@@ -33,11 +34,13 @@ import org.apache.doris.catalog.View;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.FeNameFormat;
-import org.apache.doris.common.util.PropertyAnalyzer;
+import org.apache.doris.datasource.hive.HMSExternalTable;
 import org.apache.doris.mtmv.EnvInfo;
 import org.apache.doris.mtmv.MTMVPartitionInfo;
 import org.apache.doris.mtmv.MTMVPartitionInfo.MTMVPartitionType;
+import org.apache.doris.mtmv.MTMVPartitionUtil;
 import org.apache.doris.mtmv.MTMVPlanUtil;
+import org.apache.doris.mtmv.MTMVPropertyUtil;
 import org.apache.doris.mtmv.MTMVRefreshInfo;
 import org.apache.doris.mtmv.MTMVRelatedTableIf;
 import org.apache.doris.mtmv.MTMVRelation;
@@ -174,33 +177,12 @@ public class CreateMTMVInfo {
     }
 
     private void analyzeProperties() {
-        if (properties.containsKey(PropertyAnalyzer.PROPERTIES_GRACE_PERIOD)) {
-            String gracePeriod = properties.get(PropertyAnalyzer.PROPERTIES_GRACE_PERIOD);
-            try {
-                Long.parseLong(gracePeriod);
-            } catch (NumberFormatException e) {
-                throw new AnalysisException(
-                        "valid grace_period: " + properties.get(PropertyAnalyzer.PROPERTIES_GRACE_PERIOD));
+        for (String key : MTMVPropertyUtil.mvPropertyKeys) {
+            if (properties.containsKey(key)) {
+                MTMVPropertyUtil.analyzeProperty(key, properties.get(key));
+                mvProperties.put(key, properties.get(key));
+                properties.remove(key);
             }
-            mvProperties.put(PropertyAnalyzer.PROPERTIES_GRACE_PERIOD, gracePeriod);
-            properties.remove(PropertyAnalyzer.PROPERTIES_GRACE_PERIOD);
-        }
-        if (properties.containsKey(PropertyAnalyzer.PROPERTIES_REFRESH_PARTITION_NUM)) {
-            String refreshPartitionNum = properties.get(PropertyAnalyzer.PROPERTIES_REFRESH_PARTITION_NUM);
-            try {
-                Integer.parseInt(refreshPartitionNum);
-            } catch (NumberFormatException e) {
-                throw new AnalysisException(
-                        "valid refresh_partition_num: " + properties
-                                .get(PropertyAnalyzer.PROPERTIES_REFRESH_PARTITION_NUM));
-            }
-            mvProperties.put(PropertyAnalyzer.PROPERTIES_REFRESH_PARTITION_NUM, refreshPartitionNum);
-            properties.remove(PropertyAnalyzer.PROPERTIES_REFRESH_PARTITION_NUM);
-        }
-        if (properties.containsKey(PropertyAnalyzer.PROPERTIES_EXCLUDED_TRIGGER_TABLES)) {
-            String excludedTriggerTables = properties.get(PropertyAnalyzer.PROPERTIES_EXCLUDED_TRIGGER_TABLES);
-            mvProperties.put(PropertyAnalyzer.PROPERTIES_EXCLUDED_TRIGGER_TABLES, excludedTriggerTables);
-            properties.remove(PropertyAnalyzer.PROPERTIES_EXCLUDED_TRIGGER_TABLES);
         }
     }
 
@@ -228,7 +210,7 @@ public class CreateMTMVInfo {
         }
         getRelation(planner);
         getColumns(plan);
-        analyzePartition(planner);
+        analyzePartition(planner, ctx);
     }
 
     private void getRelation(NereidsPlanner planner) {
@@ -251,7 +233,7 @@ public class CreateMTMVInfo {
         this.relation = MTMVPlanUtil.generateMTMVRelation(plan);
     }
 
-    private void analyzePartition(NereidsPlanner planner) {
+    private void analyzePartition(NereidsPlanner planner, ConnectContext ctx) {
         if (mvPartitionInfo.getPartitionType() == MTMVPartitionType.FOLLOW_BASE_TABLE) {
 
             CascadesContext cascadesContext = planner.getCascadesContext();
@@ -289,12 +271,13 @@ public class CreateMTMVInfo {
                 if (!partitionColumnNames.contains(relatedTableInfo.get().getColumn())) {
                     throw new AnalysisException("error related column: " + relatedTableInfo.get().getColumn());
                 }
-                if (partitionColumnNames.size() != 1) {
-                    throw new AnalysisException("base table for partitioning only support single column.");
+                if (!(mtmvBaseRealtedTable instanceof HMSExternalTable)
+                        && partitionColumnNames.size() != 1) {
+                    throw new AnalysisException("only hms table support multi column partition.");
                 }
                 mvPartitionInfo.setRelatedTable(relatedTableInfo.get().getTableInfo());
                 mvPartitionInfo.setRelatedCol(relatedTableInfo.get().getColumn());
-                partitionDesc = generatePartitionDesc(mtmvBaseRealtedTable);
+                partitionDesc = generatePartitionDesc(mtmvBaseRealtedTable, ctx);
             } finally {
                 // after operate, roll back the disable rules
                 sessionVariable.setDisableNereidsRules(String.join(",", tempDisableRules));
@@ -303,15 +286,30 @@ public class CreateMTMVInfo {
         }
     }
 
-    private PartitionDesc generatePartitionDesc(MTMVRelatedTableIf relatedTable) {
+    private PartitionDesc generatePartitionDesc(MTMVRelatedTableIf relatedTable, ConnectContext ctx) {
+        List<AllPartitionDesc> allPartitionDescs = null;
+        try {
+            allPartitionDescs = MTMVPartitionUtil
+                    .getPartitionDescsByRelatedTable(relatedTable, properties, mvPartitionInfo.getRelatedCol(),
+                            mvProperties);
+        } catch (org.apache.doris.common.AnalysisException e) {
+            throw new AnalysisException("getPartitionDescsByRelatedTable failed", e);
+        }
+        if (allPartitionDescs.size() > ctx.getSessionVariable().getCreateTablePartitionMaxNum()) {
+            throw new AnalysisException(String.format(
+                    "The number of partitions to be created is [%s], exceeding the maximum value of [%s]. "
+                            + "Creating too many partitions can be time-consuming. If necessary, "
+                            + "You can set the session variable 'create_table_partition_max_num' to a larger value.",
+                    allPartitionDescs.size(), ctx.getSessionVariable().getCreateTablePartitionMaxNum()));
+        }
         try {
             PartitionType type = relatedTable.getPartitionType();
             if (type == PartitionType.RANGE) {
                 return new RangePartitionDesc(Lists.newArrayList(mvPartitionInfo.getPartitionCol()),
-                        Lists.newArrayList());
+                        allPartitionDescs);
             } else if (type == PartitionType.LIST) {
                 return new ListPartitionDesc(Lists.newArrayList(mvPartitionInfo.getPartitionCol()),
-                        Lists.newArrayList());
+                        allPartitionDescs);
             } else {
                 return null;
             }

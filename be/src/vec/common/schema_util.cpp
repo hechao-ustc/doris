@@ -35,7 +35,6 @@
 #include <memory>
 #include <ostream>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -173,6 +172,7 @@ Status cast_column(const ColumnWithTypeAndName& arg, const DataTypePtr& type, Co
     // We convert column string to jsonb type just add a string jsonb field to dst column instead of parse
     // each line in original string column.
     ctx->set_string_as_jsonb_string(true);
+    ctx->set_jsonb_string_as_string(true);
     tmp_block.insert({nullptr, type, arg.name});
     RETURN_IF_ERROR(
             function->execute(ctx.get(), tmp_block, {0}, result_column, arg.column->size()));
@@ -212,6 +212,7 @@ void get_column_by_type(const vectorized::DataTypePtr& data_type, const std::str
     }
     // size is not fixed when type is string or json
     if (WhichDataType(*data_type).is_string() || WhichDataType(*data_type).is_json()) {
+        column.set_length(INT_MAX);
         return;
     }
     if (WhichDataType(*data_type).is_simple()) {
@@ -252,22 +253,13 @@ TabletColumn get_least_type_column(const TabletColumn& original, const DataTypeP
     return result_column;
 }
 
-void update_least_common_schema(const std::vector<TabletSchemaSPtr>& schemas,
-                                TabletSchemaSPtr& common_schema, int32_t variant_col_unique_id) {
-    // Types of subcolumns by path from all tuples.
-    std::unordered_map<PathInData, DataTypes, PathInData::Hash> subcolumns_types;
-    for (const TabletSchemaSPtr& schema : schemas) {
-        for (const TabletColumn& col : schema->columns()) {
-            // Get subcolumns of this variant
-            if (!col.path_info().empty() && col.parent_unique_id() > 0 &&
-                col.parent_unique_id() == variant_col_unique_id) {
-                subcolumns_types[col.path_info()].push_back(
-                        DataTypeFactory::instance().create_data_type(col, col.is_nullable()));
-            }
-        }
-    }
+void update_least_schema_internal(const std::map<PathInData, DataTypes>& subcolumns_types,
+                                  TabletSchemaSPtr& common_schema, bool update_sparse_column,
+                                  int32_t variant_col_unique_id,
+                                  std::set<PathInData>* path_set = nullptr) {
     PathsInData tuple_paths;
     DataTypes tuple_types;
+    CHECK(common_schema.use_count() == 1);
     // Get the least common type for all paths.
     for (const auto& [key, subtypes] : subcolumns_types) {
         assert(!subtypes.empty());
@@ -297,7 +289,6 @@ void update_least_common_schema(const std::vector<TabletSchemaSPtr>& schemas,
     }
     CHECK_EQ(tuple_paths.size(), tuple_types.size());
 
-    std::string variant_col_name = common_schema->column_by_uid(variant_col_unique_id).name();
     // Append all common type columns of this variant
     for (int i = 0; i < tuple_paths.size(); ++i) {
         TabletColumn common_column;
@@ -306,25 +297,100 @@ void update_least_common_schema(const std::vector<TabletSchemaSPtr>& schemas,
                            ExtraInfo {.unique_id = -1,
                                       .parent_unique_id = variant_col_unique_id,
                                       .path_info = tuple_paths[i]});
-        // set ColumnType::VARIANT to occupy _field_path_to_index
-        common_schema->append_column(common_column, TabletSchema::ColumnType::VARIANT);
+        if (update_sparse_column) {
+            common_schema->mutable_column_by_uid(variant_col_unique_id)
+                    .append_sparse_column(common_column);
+        } else {
+            common_schema->append_column(common_column);
+        }
+        if (path_set != nullptr) {
+            path_set->insert(tuple_paths[i]);
+        }
     }
+}
+
+void update_least_common_schema(const std::vector<TabletSchemaSPtr>& schemas,
+                                TabletSchemaSPtr& common_schema, int32_t variant_col_unique_id,
+                                std::set<PathInData>* path_set) {
+    // Types of subcolumns by path from all tuples.
+    std::map<PathInData, DataTypes> subcolumns_types;
+    for (const TabletSchemaSPtr& schema : schemas) {
+        for (const TabletColumnPtr& col : schema->columns()) {
+            // Get subcolumns of this variant
+            if (col->has_path_info() && col->parent_unique_id() > 0 &&
+                col->parent_unique_id() == variant_col_unique_id) {
+                subcolumns_types[*col->path_info_ptr()].push_back(
+                        DataTypeFactory::instance().create_data_type(*col, col->is_nullable()));
+            }
+        }
+    }
+    for (const TabletSchemaSPtr& schema : schemas) {
+        if (schema->field_index(variant_col_unique_id) == -1) {
+            // maybe dropped
+            continue;
+        }
+        for (const TabletColumnPtr& col :
+             schema->column_by_uid(variant_col_unique_id).sparse_columns()) {
+            // Get subcolumns of this variant
+            if (col->has_path_info() && col->parent_unique_id() > 0 &&
+                col->parent_unique_id() == variant_col_unique_id &&
+                // this column have been found in origin columns
+                subcolumns_types.find(*col->path_info_ptr()) != subcolumns_types.end()) {
+                subcolumns_types[*col->path_info_ptr()].push_back(
+                        DataTypeFactory::instance().create_data_type(*col, col->is_nullable()));
+            }
+        }
+    }
+    update_least_schema_internal(subcolumns_types, common_schema, false, variant_col_unique_id,
+                                 path_set);
+}
+
+void update_least_sparse_column(const std::vector<TabletSchemaSPtr>& schemas,
+                                TabletSchemaSPtr& common_schema, int32_t variant_col_unique_id,
+                                const std::set<PathInData>& path_set) {
+    // Types of subcolumns by path from all tuples.
+    std::map<PathInData, DataTypes> subcolumns_types;
+    for (const TabletSchemaSPtr& schema : schemas) {
+        if (schema->field_index(variant_col_unique_id) == -1) {
+            // maybe dropped
+            continue;
+        }
+        for (const TabletColumnPtr& col :
+             schema->column_by_uid(variant_col_unique_id).sparse_columns()) {
+            // Get subcolumns of this variant
+            if (col->has_path_info() && col->parent_unique_id() > 0 &&
+                col->parent_unique_id() == variant_col_unique_id &&
+                path_set.find(*col->path_info_ptr()) == path_set.end()) {
+                subcolumns_types[*col->path_info_ptr()].push_back(
+                        DataTypeFactory::instance().create_data_type(*col, col->is_nullable()));
+            }
+        }
+    }
+    update_least_schema_internal(subcolumns_types, common_schema, true, variant_col_unique_id);
 }
 
 void inherit_tablet_index(TabletSchemaSPtr& schema) {
     std::unordered_map<int32_t, TabletIndex> variants_index_meta;
     // Get all variants tablet index metas if exist
     for (const auto& col : schema->columns()) {
-        auto index_meta = schema->get_inverted_index(col.unique_id(), "");
-        if (col.is_variant_type() && index_meta != nullptr) {
-            variants_index_meta.emplace(col.unique_id(), *index_meta);
+        auto index_meta = schema->get_inverted_index(col->unique_id(), "");
+        if (col->is_variant_type() && index_meta != nullptr) {
+            variants_index_meta.emplace(col->unique_id(), *index_meta);
         }
     }
 
     // Add index meta if extracted column is missing index meta
-    for (const auto& col : schema->columns()) {
+    for (size_t i = 0; i < schema->num_columns(); ++i) {
+        TabletColumn& col = schema->mutable_column(i);
         if (!col.is_extracted_column()) {
             continue;
+        }
+        if (col.type() != FieldType::OLAP_FIELD_TYPE_TINYINT &&
+            col.type() != FieldType::OLAP_FIELD_TYPE_ARRAY &&
+            col.type() != FieldType::OLAP_FIELD_TYPE_DOUBLE &&
+            col.type() != FieldType::OLAP_FIELD_TYPE_FLOAT) {
+            // above types are not supported in bf
+            col.set_is_bf_column(schema->column(col.parent_unique_id()).is_bf_column());
         }
         auto it = variants_index_meta.find(col.parent_unique_id());
         // variant has no index meta, ignore
@@ -334,7 +400,7 @@ void inherit_tablet_index(TabletSchemaSPtr& schema) {
         auto index_meta = schema->get_inverted_index(col);
         // add index meta
         TabletIndex index_info = it->second;
-        index_info.set_escaped_escaped_index_suffix_path(col.path_info().get_path());
+        index_info.set_escaped_escaped_index_suffix_path(col.path_info_ptr()->get_path());
         if (index_meta != nullptr) {
             // already exist
             schema->update_index(col, index_info);
@@ -358,12 +424,12 @@ Status get_least_common_schema(const std::vector<TabletSchemaSPtr>& schemas,
         // Merge columns from other schemas
         output_schema->clear_columns();
         // Get all columns without extracted columns and collect variant col unique id
-        for (const TabletColumn& col : base_schema->columns()) {
-            if (col.is_variant_type()) {
-                variant_column_unique_id.push_back(col.unique_id());
+        for (const TabletColumnPtr& col : base_schema->columns()) {
+            if (col->is_variant_type()) {
+                variant_column_unique_id.push_back(col->unique_id());
             }
-            if (!col.is_extracted_column()) {
-                output_schema->append_column(col);
+            if (!col->is_extracted_column()) {
+                output_schema->append_column(*col);
             }
         }
     };
@@ -381,8 +447,24 @@ Status get_least_common_schema(const std::vector<TabletSchemaSPtr>& schemas,
         build_schema_without_extracted_columns(base_schema);
     }
 
+    // schema consists of two parts, static part of columns, variant columns (include extracted columns and sparse columns)
+    //     static     extracted       sparse
+    // | --------- | ----------- | ------------|
+    // If a sparse column in one schema's is found in another schema's extracted columns
+    // move it out of the sparse column and merge it into the extracted column.
+    //                     static                extracted                         sparse
+    //                 | --------- | ----------- ------------ ------- ---------| ------------|
+    //    schema 1:       k (int)     v:a (float)       v:c (string)               v:b (int)
+    //    schema 2:       k (int)     v:a (float)       v:b (bigint)               v:d (string)
+    //    schema 3:       k (int)     v:a (double)      v:b (smallint)
+    //    result :        k (int)     v:a (double)  v:b (bigint) v:c (string)      v:d (string)
     for (int32_t unique_id : variant_column_unique_id) {
-        update_least_common_schema(schemas, output_schema, unique_id);
+        std::set<PathInData> path_set;
+        // 1. cast extracted column to common type
+        // path set is used to record the paths of those sparse columns that have been merged into the extracted columns, eg: v:b
+        update_least_common_schema(schemas, output_schema, unique_id, &path_set);
+        // 2. cast sparse column to common type, exclude the columns from the path set
+        update_least_sparse_column(schemas, output_schema, unique_id, path_set);
     }
 
     inherit_tablet_index(output_schema);
@@ -391,6 +473,7 @@ Status get_least_common_schema(const std::vector<TabletSchemaSPtr>& schemas,
         return Status::DataQualityError("Reached max column size limit {}",
                                         config::variant_max_merged_tablet_schema_size);
     }
+
     return Status::OK();
 }
 
@@ -498,6 +581,8 @@ void finalize_variant_columns(Block& block, const std::vector<int>& variant_pos,
                         ? assert_cast<ColumnObject&>(
                                   assert_cast<ColumnNullable&>(column_ref).get_nested_column())
                         : assert_cast<ColumnObject&>(column_ref);
+        // Record information about columns merged into a sparse column within a variant
+        std::vector<TabletColumn> sparse_subcolumns_schema;
         column.finalize(ignore_sparse);
     }
 }
@@ -515,6 +600,112 @@ void encode_variant_sparse_subcolumns(Block& block, const std::vector<int>& vari
         column.ensure_root_node_type(expected_root_type);
         column.merge_sparse_to_root_column();
     }
+}
+
+static void _append_column(const TabletColumn& parent_variant,
+                           const ColumnObject::Subcolumns::NodePtr& subcolumn,
+                           TabletSchemaSPtr& to_append, bool is_sparse) {
+    // If column already exist in original tablet schema, then we pick common type
+    // and cast column to common type, and modify tablet column to common type,
+    // otherwise it's a new column
+    CHECK(to_append.use_count() == 1);
+    const std::string& column_name =
+            parent_variant.name_lower_case() + "." + subcolumn->path.get_path();
+    const vectorized::DataTypePtr& final_data_type_from_object =
+            subcolumn->data.get_least_common_type();
+    vectorized::PathInDataBuilder full_path_builder;
+    auto full_path = full_path_builder.append(parent_variant.name_lower_case(), false)
+                             .append(subcolumn->path.get_parts(), false)
+                             .build();
+    TabletColumn tablet_column = vectorized::schema_util::get_column_by_type(
+            final_data_type_from_object, column_name,
+            vectorized::schema_util::ExtraInfo {.unique_id = -1,
+                                                .parent_unique_id = parent_variant.unique_id(),
+                                                .path_info = full_path});
+
+    if (!is_sparse) {
+        to_append->append_column(std::move(tablet_column));
+    } else {
+        to_append->mutable_column_by_uid(parent_variant.unique_id())
+                .append_sparse_column(std::move(tablet_column));
+    }
+}
+
+// sort by paths in lexicographical order
+static vectorized::ColumnObject::Subcolumns get_sorted_subcolumns(
+        const vectorized::ColumnObject::Subcolumns& subcolumns) {
+    // sort by paths in lexicographical order
+    vectorized::ColumnObject::Subcolumns sorted = subcolumns;
+    std::sort(sorted.begin(), sorted.end(), [](const auto& lhsItem, const auto& rhsItem) {
+        return lhsItem->path < rhsItem->path;
+    });
+    return sorted;
+}
+
+void rebuild_schema_and_block(const TabletSchemaSPtr& original,
+                              const std::vector<int>& variant_positions, Block& flush_block,
+                              TabletSchemaSPtr& flush_schema) {
+    // rebuild schema and block with variant extracted columns
+
+    // 1. Flatten variant column into flat columns, append flatten columns to the back of original Block and TabletSchema
+    // those columns are extracted columns, leave none extracted columns remain in original variant column, which is
+    // JSONB format at present.
+    // 2. Collect columns that need to be added or modified when data type changes or new columns encountered
+    for (size_t variant_pos : variant_positions) {
+        auto column_ref = flush_block.get_by_position(variant_pos).column;
+        bool is_nullable = column_ref->is_nullable();
+        const vectorized::ColumnObject& object_column = assert_cast<vectorized::ColumnObject&>(
+                remove_nullable(column_ref)->assume_mutable_ref());
+        const TabletColumn& parent_column = *original->columns()[variant_pos];
+        CHECK(object_column.is_finalized());
+        std::shared_ptr<vectorized::ColumnObject::Subcolumns::Node> root;
+        // common extracted columns
+        for (const auto& entry : get_sorted_subcolumns(object_column.get_subcolumns())) {
+            if (entry->path.empty()) {
+                // root
+                root = entry;
+                continue;
+            }
+            _append_column(parent_column, entry, flush_schema, false);
+            const std::string& column_name =
+                    parent_column.name_lower_case() + "." + entry->path.get_path();
+            flush_block.insert({entry->data.get_finalized_column_ptr()->get_ptr(),
+                                entry->data.get_least_common_type(), column_name});
+        }
+
+        // add sparse columns to flush_schema
+        for (const auto& entry : get_sorted_subcolumns(object_column.get_sparse_subcolumns())) {
+            _append_column(parent_column, entry, flush_schema, true);
+        }
+
+        // Create new variant column and set root column
+        auto obj = vectorized::ColumnObject::create(true, false);
+        // '{}' indicates a root path
+        static_cast<vectorized::ColumnObject*>(obj.get())->add_sub_column(
+                {}, root->data.get_finalized_column_ptr()->assume_mutable(),
+                root->data.get_least_common_type());
+        // // set for rowstore
+        if (original->store_row_column()) {
+            static_cast<vectorized::ColumnObject*>(obj.get())->set_rowstore_column(
+                    object_column.get_rowstore_column());
+        }
+        vectorized::ColumnPtr result = obj->get_ptr();
+        if (is_nullable) {
+            const auto& null_map = assert_cast<const vectorized::ColumnNullable&>(*column_ref)
+                                           .get_null_map_column_ptr();
+            result = vectorized::ColumnNullable::create(result, null_map);
+        }
+        flush_block.get_by_position(variant_pos).column = result;
+        vectorized::PathInDataBuilder full_root_path_builder;
+        auto full_root_path =
+                full_root_path_builder.append(parent_column.name_lower_case(), false).build();
+        TabletColumn new_col = flush_schema->column(variant_pos);
+        new_col.set_path_info(full_root_path);
+        flush_schema->replace_column(variant_pos, new_col);
+        VLOG_DEBUG << "set root_path : " << full_root_path.get_path();
+    }
+
+    vectorized::schema_util::inherit_tablet_index(flush_schema);
 }
 
 // ---------------------------

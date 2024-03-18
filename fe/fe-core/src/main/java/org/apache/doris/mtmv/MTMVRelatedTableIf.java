@@ -24,8 +24,12 @@ import org.apache.doris.catalog.TableIf;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
 
+import com.google.common.collect.Maps;
+
 import java.util.List;
 import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -38,17 +42,32 @@ public interface MTMVRelatedTableIf extends TableIf {
      *
      * @return partitionId->PartitionItem
      */
-    Map<Long, PartitionItem> getPartitionItems();
+    Map<Long, PartitionItem> getAndCopyPartitionItems();
 
     /**
-     * Obtain the latest update time of partition data
+     * Obtain a list of partitions filtered by time
      *
-     * @param partitionId
-     * @param item
-     * @return millisecond
+     * @param pos The position of the partition column to be checked in all partition columns
+     * @param config
+     * @return
      * @throws AnalysisException
      */
-    long getPartitionLastModifyTime(long partitionId, PartitionItem item) throws AnalysisException;
+    default Map<Long, PartitionItem> getPartitionItemsByTimeFilter(int pos, MTMVPartitionSyncConfig config)
+            throws AnalysisException {
+        Map<Long, PartitionItem> partitionItems = getAndCopyPartitionItems();
+        if (config.getSyncLimit() <= 0) {
+            return partitionItems;
+        }
+        long nowTruncSubSec = MTMVUtil.getNowTruncSubSec(config.getTimeUnit(), config.getSyncLimit());
+        Optional<String> dateFormat = config.getDateFormat();
+        Map<Long, PartitionItem> res = Maps.newHashMap();
+        for (Entry<Long, PartitionItem> entry : partitionItems.entrySet()) {
+            if (entry.getValue().isGreaterThanSpecifiedTime(pos, dateFormat, nowTruncSubSec)) {
+                res.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return res;
+    }
 
     /**
      * getPartitionType LIST/RANGE/UNPARTITIONED
@@ -66,17 +85,50 @@ public interface MTMVRelatedTableIf extends TableIf {
     Set<String> getPartitionColumnNames() throws DdlException;
 
     /**
-     * Obtain the latest update time of table data
-     *
-     * @return
-     * @throws AnalysisException
-     */
-    long getLastModifyTime() throws AnalysisException;
-
-    /**
      * getPartitionColumns
      *
      * @return
      */
     List<Column> getPartitionColumns();
+
+    /**
+     * getPartitionSnapshot
+     *
+     * @param partitionId
+     * @return partition snapshot at current time
+     * @throws AnalysisException
+     */
+    MTMVSnapshotIf getPartitionSnapshot(long partitionId) throws AnalysisException;
+
+    /**
+     * getTableSnapshot
+     *
+     * @return table snapshot at current time
+     * @throws AnalysisException
+     */
+    MTMVSnapshotIf getTableSnapshot() throws AnalysisException;
+
+    /**
+     * getPartitionName
+     *
+     * @param partitionId
+     * @return partitionName
+     * @throws AnalysisException
+     */
+    String getPartitionName(long partitionId) throws AnalysisException;
+
+    /**
+     * Does the current type of table allow timed triggering
+     *
+     * @return If return false,The method of comparing whether to synchronize will directly return true,
+     *         otherwise the snapshot information will be compared
+     */
+    boolean needAutoRefresh();
+
+    /**
+     * if allow partition column `isAllowNull`
+     *
+     * @return
+     */
+    boolean isPartitionColumnAllowNull();
 }

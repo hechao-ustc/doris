@@ -125,7 +125,10 @@ enum TSchemaTableType {
     SCH_COLUMN_STATISTICS,
     SCH_PARAMETERS,
     SCH_METADATA_NAME_IDS,
-    SCH_PROFILING;
+    SCH_PROFILING,
+    SCH_BACKEND_ACTIVE_TASKS,
+    SCH_ACTIVE_QUERIES,
+    SCH_WORKLOAD_GROUPS;
 }
 
 enum THdfsCompression {
@@ -234,7 +237,8 @@ struct TOlapTableSchemaParam {
     7: optional bool is_dynamic_schema // deprecated
     8: optional bool is_partial_update
     9: optional list<string> partial_update_input_columns
-    10: optional bool is_strict_mode = false;
+    10: optional bool is_strict_mode = false
+    11: optional string auto_increment_column
 }
 
 struct TTabletLocation {
@@ -324,11 +328,12 @@ struct TJdbcTable {
   6: optional string jdbc_resource_name
   7: optional string jdbc_driver_class
   8: optional string jdbc_driver_checksum
-  9: optional i32 jdbc_min_pool_size
-  10: optional i32 jdbc_max_pool_size
-  11: optional i32 jdbc_max_idle_time
-  12: optional i32 jdbc_max_wait_time
-  13: optional bool jdbc_keep_alive
+  9: optional i32 connection_pool_min_size
+  10: optional i32 connection_pool_max_size
+  11: optional i32 connection_pool_max_wait_time
+  12: optional i32 connection_pool_max_life_time
+  13: optional bool connection_pool_keep_alive
+  14: optional i64 catalog_id
 }
 
 struct TMCTable {
@@ -338,6 +343,14 @@ struct TMCTable {
   4: optional string access_key
   5: optional string secret_key
   6: optional string public_access
+  7: optional string odps_url
+  8: optional string tunnel_url
+}
+
+struct TTrinoConnectorTable {
+  1: optional string db_name
+  2: optional string table_name
+  3: optional map<string, string> properties
 }
 
 // "Union" of all table types.
@@ -363,6 +376,7 @@ struct TTableDescriptor {
   19: optional THudiTable hudiTable
   20: optional TJdbcTable jdbcTable
   21: optional TMCTable mcTable
+  22: optional TTrinoConnectorTable trinoConnectorTable
 }
 
 struct TDescriptorTable {

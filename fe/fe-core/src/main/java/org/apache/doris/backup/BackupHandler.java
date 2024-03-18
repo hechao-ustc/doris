@@ -296,6 +296,11 @@ public class BackupHandler extends MasterDaemon implements Writable {
 
     // the entry method of submitting a backup or restore job
     public void process(AbstractBackupStmt stmt) throws DdlException {
+        if (Config.isCloudMode()) {
+            ErrorReport.reportDdlException(ErrorCode.ERR_COMMON_ERROR,
+                    "BACKUP and RESTORE are not supported by the cloud mode yet");
+        }
+
         // check if repo exist
         String repoName = stmt.getRepoName();
         Repository repository = null;
@@ -516,6 +521,12 @@ public class BackupHandler extends MasterDaemon implements Writable {
     }
 
     private void addBackupOrRestoreJob(long dbId, AbstractJob job) {
+        // If there are too many backup/restore jobs, it may cause OOM.  If the job num option is set to 0,
+        // skip all backup/restore jobs.
+        if (Config.max_backup_restore_job_num_per_db <= 0) {
+            return;
+        }
+
         jobLock.lock();
         try {
             Deque<AbstractJob> jobs = dbIdToBackupOrRestoreJobs.computeIfAbsent(dbId, k -> Lists.newLinkedList());

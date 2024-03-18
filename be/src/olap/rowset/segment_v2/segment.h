@@ -66,6 +66,7 @@ namespace segment_v2 {
 class BitmapIndexIterator;
 class Segment;
 class InvertedIndexIterator;
+class InvertedIndexFileReader;
 
 using SegmentSharedPtr = std::shared_ptr<Segment>;
 // A Segment is used to represent a segment in memory format. When segment is
@@ -153,7 +154,7 @@ public:
     // ignore_chidren set to false will treat field as variant
     // when it contains children with field paths.
     // nullptr will returned if storage type does not contains such column
-    std::shared_ptr<const vectorized::IDataType> get_data_type_of(vectorized::PathInData path,
+    std::shared_ptr<const vectorized::IDataType> get_data_type_of(vectorized::PathInDataPtr path,
                                                                   bool is_nullable,
                                                                   bool ignore_children) const;
 
@@ -194,7 +195,14 @@ private:
     Status _load_pk_bloom_filter();
     ColumnReader* _get_column_reader(const TabletColumn& col);
 
+    // Get Iterator which will read variant root column and extract with paths and types info
+    Status _new_iterator_with_variant_root(const TabletColumn& tablet_column,
+                                           std::unique_ptr<ColumnIterator>* iter,
+                                           const SubcolumnColumnReaders::Node* root,
+                                           vectorized::DataTypePtr target_type_hint);
+
     Status _load_index_impl();
+    Status _open_inverted_index();
 
 private:
     friend class SegmentIterator;
@@ -223,6 +231,9 @@ private:
     // for variants.
     SubcolumnColumnReaders _sub_column_tree;
 
+    // each sprase column's path and types info
+    SubcolumnColumnReaders _sparse_column_tree;
+
     // used to guarantee that short key index will be loaded at most once in a thread-safe way
     DorisCallOnce<Status> _load_index_once;
     // used to guarantee that primary key bloom filter will be loaded at most once in a thread-safe way
@@ -236,6 +247,9 @@ private:
     // Segment may be destructed after StorageEngine, in order to exit gracefully.
     std::shared_ptr<MemTracker> _segment_meta_mem_tracker;
     std::mutex _open_lock;
+    // inverted index file reader
+    std::shared_ptr<InvertedIndexFileReader> _inverted_index_file_reader;
+    DorisCallOnce<Status> _inverted_index_file_reader_open;
 };
 
 } // namespace segment_v2

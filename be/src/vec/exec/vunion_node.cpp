@@ -216,12 +216,22 @@ Status VUnionNode::get_next_const(RuntimeState* state, Block* block) {
         tmp_block.insert({vectorized::ColumnUInt8::create(1),
                           std::make_shared<vectorized::DataTypeUInt8>(), ""});
         int const_expr_lists_size = _const_expr_lists[_const_expr_list_idx].size();
+        if (_const_expr_list_idx && const_expr_lists_size != _const_expr_lists[0].size()) {
+            return Status::InternalError(
+                    "[UnionNode]const expr at {}'s count({}) not matched({} expected)",
+                    _const_expr_list_idx, const_expr_lists_size, _const_expr_lists[0].size());
+        }
         std::vector<int> result_list(const_expr_lists_size);
         for (size_t i = 0; i < const_expr_lists_size; ++i) {
             RETURN_IF_ERROR(_const_expr_lists[_const_expr_list_idx][i]->execute(&tmp_block,
                                                                                 &result_list[i]));
         }
         tmp_block.erase_not_in(result_list);
+        if (tmp_block.columns() != mblock.columns()) {
+            return Status::InternalError(
+                    "[UnionNode]columns count of const expr block not matched ({} vs {})",
+                    tmp_block.columns(), mblock.columns());
+        }
         if (tmp_block.rows() > 0) {
             RETURN_IF_ERROR(mblock.merge(tmp_block));
             tmp_block.clear();
@@ -266,7 +276,7 @@ Status VUnionNode::get_next(RuntimeState* state, Block* block, bool* eos) {
         // The previous child needs to be closed if passthrough was enabled for it. In the non
         // passthrough case, the child was already closed in the previous call to get_next().
         DCHECK(is_child_passthrough(_to_close_child_idx));
-        static_cast<void>(child(_to_close_child_idx)->close(state));
+        RETURN_IF_ERROR(child(_to_close_child_idx)->close(state));
         _to_close_child_idx = -1;
     }
 

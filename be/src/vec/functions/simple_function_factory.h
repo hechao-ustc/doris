@@ -65,6 +65,7 @@ void register_function_running_difference(SimpleFunctionFactory& factory);
 void register_function_date_time_to_string(SimpleFunctionFactory& factory);
 void register_function_date_time_string_to_string(SimpleFunctionFactory& factory);
 void register_function_in(SimpleFunctionFactory& factory);
+void register_function_collection_in(SimpleFunctionFactory& factory);
 void register_function_if(SimpleFunctionFactory& factory);
 void register_function_nullif(SimpleFunctionFactory& factory);
 void register_function_date_time_computation(SimpleFunctionFactory& factory);
@@ -90,6 +91,7 @@ void register_function_array(SimpleFunctionFactory& factory);
 void register_function_map(SimpleFunctionFactory& factory);
 void register_function_struct(SimpleFunctionFactory& factory);
 void register_function_struct_element(SimpleFunctionFactory& factory);
+void register_function_variant_element(SimpleFunctionFactory& factory);
 void register_function_geo(SimpleFunctionFactory& factory);
 void register_function_multi_string_position(SimpleFunctionFactory& factory);
 void register_function_multi_string_search(SimpleFunctionFactory& factory);
@@ -109,8 +111,8 @@ class SimpleFunctionFactory {
     using Creator = std::function<FunctionBuilderPtr()>;
     using FunctionCreators = phmap::flat_hash_map<std::string, Creator>;
     using FunctionIsVariadic = phmap::flat_hash_set<std::string>;
-    /// @TEMPORARY: for be_exec_version=3
-    constexpr static int NEWEST_VERSION_FUNCTION_SUBSTITUTE = 3;
+    /// @TEMPORARY: for be_exec_version=4
+    constexpr static int NEWEST_VERSION_FUNCTION_SUBSTITUTE = 4;
 
 public:
     void register_function(const std::string& name, const Creator& ptr) {
@@ -178,8 +180,12 @@ public:
 
         auto iter = function_creators.find(key_str);
         if (iter == function_creators.end()) {
-            LOG(WARNING) << fmt::format("Function signature {} is not found", key_str);
-            return nullptr;
+            // use original name as signature without variadic arguments
+            iter = function_creators.find(name);
+            if (iter == function_creators.end()) {
+                LOG(WARNING) << fmt::format("Function signature {} is not found", key_str);
+                return nullptr;
+            }
         }
 
         return iter->second()->build(arguments, return_type);
@@ -240,6 +246,7 @@ public:
             register_function_time_of_function(instance);
             register_function_string(instance);
             register_function_in(instance);
+            register_function_collection_in(instance);
             register_function_if(instance);
             register_function_nullif(instance);
             register_function_date_time_computation(instance);
@@ -280,6 +287,7 @@ public:
             register_function_ip(instance);
             register_function_tokenize(instance);
             register_function_ignore(instance);
+            register_function_variant_element(instance);
         });
         return instance;
     }

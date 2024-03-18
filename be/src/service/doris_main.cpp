@@ -39,6 +39,8 @@
 #include <tuple>
 #include <vector>
 
+#include "cloud/cloud_backend_service.h"
+#include "cloud/config.h"
 #include "common/stack_trace.h"
 #include "olap/tablet_schema_cache.h"
 #include "olap/utils.h"
@@ -56,10 +58,9 @@
 #include "common/config.h"
 #include "common/daemon.h"
 #include "common/logging.h"
-#include "common/phdr_cache.h"
 #include "common/signal_handler.h"
 #include "common/status.h"
-#include "io/cache/block/block_file_cache_factory.h"
+#include "io/cache/block_file_cache_factory.h"
 #include "olap/options.h"
 #include "olap/storage_engine.h"
 #include "runtime/exec_env.h"
@@ -381,8 +382,11 @@ int main(int argc, char** argv) {
     doris::init_thrift_logging();
 
     if (doris::config::enable_fuzzy_mode) {
-        LOG(INFO) << "enable_fuzzy_mode is true, set fuzzy configs";
-        doris::config::set_fuzzy_configs();
+        Status status = doris::config::set_fuzzy_configs();
+        if (!status.ok()) {
+            LOG(WARNING) << "Failed to initialize fuzzy config: " << status;
+            exit(1);
+        }
     }
 
 #if !defined(__SANITIZE_ADDRESS__) && !defined(ADDRESS_SANITIZER) && !defined(LEAK_SANITIZER) && \
@@ -400,6 +404,14 @@ int main(int argc, char** argv) {
     auto olap_res = doris::parse_conf_store_paths(doris::config::storage_root_path, &paths);
     if (!olap_res) {
         LOG(ERROR) << "parse config storage path failed, path=" << doris::config::storage_root_path;
+        exit(-1);
+    }
+
+    std::vector<doris::StorePath> spill_paths;
+    olap_res = doris::parse_conf_store_paths(doris::config::spill_storage_root_path, &spill_paths);
+    if (!olap_res) {
+        LOG(ERROR) << "parse config spill storage path failed, path="
+                   << doris::config::spill_storage_root_path;
         exit(-1);
     }
     std::set<std::string> broken_paths;
@@ -430,6 +442,25 @@ int main(int argc, char** argv) {
 
     if (paths.empty()) {
         LOG(ERROR) << "All disks are broken, exit.";
+        exit(-1);
+    }
+
+    it = spill_paths.begin();
+    for (; it != spill_paths.end();) {
+        if (!doris::check_datapath_rw(it->path)) {
+            if (doris::config::ignore_broken_disk) {
+                LOG(WARNING) << "read write test file failed, path=" << it->path;
+                it = spill_paths.erase(it);
+            } else {
+                LOG(ERROR) << "read write test file failed, path=" << it->path;
+                exit(-1);
+            }
+        } else {
+            ++it;
+        }
+    }
+    if (spill_paths.empty()) {
+        LOG(ERROR) << "All spill disks are broken, exit.";
         exit(-1);
     }
 
@@ -483,24 +514,32 @@ int main(int argc, char** argv) {
     doris::ThreadLocalHandle::create_thread_local_if_not_exits();
 
     // init exec env
-    auto exec_env(doris::ExecEnv::GetInstance());
-    status = doris::ExecEnv::init(doris::ExecEnv::GetInstance(), paths, broken_paths);
+    auto* exec_env(doris::ExecEnv::GetInstance());
+    status = doris::ExecEnv::init(doris::ExecEnv::GetInstance(), paths, spill_paths, broken_paths);
     if (status != Status::OK()) {
-        LOG(ERROR) << "failed to init doris storage engine, res=" << status;
-        exit(-1);
+        std::cerr << "failed to init doris storage engine, res=" << status;
+        return 0;
     }
 
     // begin to start services
     doris::ThriftRpcHelper::setup(exec_env);
     // 1. thrift server with be_port
     std::unique_ptr<doris::ThriftServer> be_server;
-    EXIT_IF_ERROR(
-            doris::BackendService::create_service(exec_env, doris::config::be_port, &be_server));
+
+    if (doris::config::is_cloud_mode()) {
+        EXIT_IF_ERROR(doris::CloudBackendService::create_service(
+                exec_env->storage_engine().to_cloud(), exec_env, doris::config::be_port,
+                &be_server));
+    } else {
+        EXIT_IF_ERROR(doris::BackendService::create_service(exec_env->storage_engine().to_local(),
+                                                            exec_env, doris::config::be_port,
+                                                            &be_server));
+    }
+
     status = be_server->start();
     if (!status.ok()) {
-        LOG(ERROR) << "Doris Be server did not start correctly, exiting";
-        doris::shutdown_logging();
-        exit(1);
+        std::cerr << "Doris BE server did not start correctly, exiting\n";
+        exit(-1);
     }
 
     // 2. bprc service
@@ -508,9 +547,8 @@ int main(int argc, char** argv) {
             std::make_unique<doris::BRpcService>(exec_env);
     status = brpc_service->start(doris::config::brpc_port, doris::config::brpc_num_threads);
     if (!status.ok()) {
-        LOG(ERROR) << "BRPC service did not start correctly, exiting";
-        doris::shutdown_logging();
-        exit(1);
+        std::cerr << "BRPC service did not start correctly, exiting\n";
+        exit(-1);
     }
 
     // 3. http service
@@ -518,9 +556,8 @@ int main(int argc, char** argv) {
             exec_env, doris::config::webserver_port, doris::config::webserver_num_workers);
     status = http_service->start();
     if (!status.ok()) {
-        LOG(ERROR) << "Doris Be http service did not start correctly, exiting";
-        doris::shutdown_logging();
-        exit(1);
+        std::cerr << "Doris Be http service did not start correctly, exiting\n";
+        exit(-1);
     }
 
     // 4. heart beat server
@@ -531,16 +568,15 @@ int main(int argc, char** argv) {
             doris::config::heartbeat_service_thread_count, master_info);
 
     if (!heartbeat_status.ok()) {
-        LOG(ERROR) << "Heartbeat services did not start correctly, exiting";
-        doris::shutdown_logging();
-        exit(1);
+        std::cerr << "Heartbeat services did not start correctly, exiting";
+        exit(-1);
     }
 
     status = heartbeat_thrift_server->start();
     if (!status.ok()) {
-        LOG(ERROR) << "Doris BE HeartBeat Service did not start correctly, exiting: " << status;
-        doris::shutdown_logging();
-        exit(1);
+        std::cerr << "Doris BE HeartBeat Service did not start correctly, exiting: " << status
+                  << '\n';
+        exit(-1);
     }
 
     // 5. arrow flight service
@@ -552,10 +588,9 @@ int main(int argc, char** argv) {
     doris::Daemon daemon;
     daemon.start();
     if (!status.ok()) {
-        LOG(ERROR) << "Arrow Flight Service did not start correctly, exiting, "
-                   << status.to_string();
-        doris::shutdown_logging();
-        exit(1);
+        std::cerr << "Arrow Flight Service did not start correctly, exiting, " << status.to_string()
+                  << '\n';
+        exit(-1);
     }
 
     while (!doris::k_doris_exit) {

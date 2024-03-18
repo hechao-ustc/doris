@@ -35,6 +35,7 @@ import org.apache.doris.statistics.Statistics;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Supplier;
 import com.google.common.base.Suppliers;
+import com.google.common.collect.Lists;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -74,8 +75,8 @@ public abstract class AbstractPlan extends AbstractTreeNode<Plan> implements Pla
         this.type = Objects.requireNonNull(type, "type can not be null");
         this.groupExpression = Objects.requireNonNull(groupExpression, "groupExpression can not be null");
         Objects.requireNonNull(optLogicalProperties, "logicalProperties can not be null");
-        this.logicalPropertiesSupplier = Suppliers.memoize(() -> optLogicalProperties.orElseGet(
-                this::computeLogicalProperties));
+        this.logicalPropertiesSupplier = Suppliers.memoize(() ->
+                optLogicalProperties.orElseGet(this::computeLogicalProperties));
         this.statistics = statistics;
         this.id = StatementScopeIdGenerator.newObjectId();
     }
@@ -165,8 +166,14 @@ public abstract class AbstractPlan extends AbstractTreeNode<Plan> implements Pla
 
     @Override
     public LogicalProperties computeLogicalProperties() {
-        boolean hasUnboundChild = children.stream()
-                .anyMatch(child -> !child.bound());
+        boolean hasUnboundChild = false;
+        for (Plan child : children) {
+            if (!child.bound()) {
+                hasUnboundChild = true;
+                break;
+            }
+        }
+
         if (hasUnboundChild || hasUnboundExpression()) {
             return UnboundLogicalProperties.INSTANCE;
         } else {
@@ -190,5 +197,19 @@ public abstract class AbstractPlan extends AbstractTreeNode<Plan> implements Pla
 
     public int getId() {
         return id.asInt();
+    }
+
+    /**
+     * ancestors in the tree
+     */
+    public List<Plan> getAncestors() {
+        List<Plan> ancestors = Lists.newArrayList();
+        ancestors.add(this);
+        Optional<Object> parent = this.getMutableState(MutableState.KEY_PARENT);
+        while (parent.isPresent()) {
+            ancestors.add((Plan) parent.get());
+            parent = ((Plan) parent.get()).getMutableState(MutableState.KEY_PARENT);
+        }
+        return ancestors;
     }
 }

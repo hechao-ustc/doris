@@ -20,11 +20,12 @@
 #include "pipeline/exec/hashjoin_probe_operator.h"
 #include "pipeline/exec/nested_loop_join_probe_operator.h"
 #include "pipeline/exec/operator.h"
+#include "pipeline/exec/partitioned_hash_join_probe_operator.h"
 
 namespace doris::pipeline {
 
-template <typename DependencyType, typename Derived>
-Status JoinProbeLocalState<DependencyType, Derived>::init(RuntimeState* state,
+template <typename SharedStateArg, typename Derived>
+Status JoinProbeLocalState<SharedStateArg, Derived>::init(RuntimeState* state,
                                                           LocalStateInfo& info) {
     RETURN_IF_ERROR(Base::init(state, info));
     auto& p = Base::_parent->template cast<typename Derived::Parent>();
@@ -46,8 +47,8 @@ Status JoinProbeLocalState<DependencyType, Derived>::init(RuntimeState* state,
     return Status::OK();
 }
 
-template <typename DependencyType, typename Derived>
-Status JoinProbeLocalState<DependencyType, Derived>::close(RuntimeState* state) {
+template <typename SharedStateArg, typename Derived>
+Status JoinProbeLocalState<SharedStateArg, Derived>::close(RuntimeState* state) {
     if (Base::_closed) {
         return Status::OK();
     }
@@ -55,8 +56,8 @@ Status JoinProbeLocalState<DependencyType, Derived>::close(RuntimeState* state) 
     return Base::close(state);
 }
 
-template <typename DependencyType, typename Derived>
-void JoinProbeLocalState<DependencyType, Derived>::_construct_mutable_join_block() {
+template <typename SharedStateArg, typename Derived>
+void JoinProbeLocalState<SharedStateArg, Derived>::_construct_mutable_join_block() {
     auto& p = Base::_parent->template cast<typename Derived::Parent>();
     const auto& mutable_block_desc = p._intermediate_row_desc;
     for (const auto tuple_desc : mutable_block_desc->tuple_descriptors()) {
@@ -77,8 +78,8 @@ void JoinProbeLocalState<DependencyType, Derived>::_construct_mutable_join_block
     }
 }
 
-template <typename DependencyType, typename Derived>
-Status JoinProbeLocalState<DependencyType, Derived>::_build_output_block(
+template <typename SharedStateArg, typename Derived>
+Status JoinProbeLocalState<SharedStateArg, Derived>::_build_output_block(
         vectorized::Block* origin_block, vectorized::Block* output_block, bool keep_origin) {
     auto& p = Base::_parent->template cast<typename Derived::Parent>();
     SCOPED_TIMER(_build_output_block_timer);
@@ -112,13 +113,15 @@ Status JoinProbeLocalState<DependencyType, Derived>::_build_output_block(
     if (rows != 0) {
         auto& mutable_columns = mutable_block.mutable_columns();
         if (_output_expr_ctxs.empty()) {
-            DCHECK(mutable_columns.size() == p.row_desc().num_materialized_slots());
+            DCHECK(mutable_columns.size() == p.row_desc().num_materialized_slots())
+                    << mutable_columns.size() << " " << p.row_desc().num_materialized_slots();
             for (int i = 0; i < mutable_columns.size(); ++i) {
                 insert_column_datas(mutable_columns[i], origin_block->get_by_position(i).column,
                                     rows);
             }
         } else {
-            DCHECK(mutable_columns.size() == p.row_desc().num_materialized_slots());
+            DCHECK(mutable_columns.size() == p.row_desc().num_materialized_slots())
+                    << mutable_columns.size() << " " << p.row_desc().num_materialized_slots();
             SCOPED_TIMER(Base::_projection_timer);
             for (int i = 0; i < mutable_columns.size(); ++i) {
                 auto result_column_id = -1;
@@ -148,8 +151,8 @@ Status JoinProbeLocalState<DependencyType, Derived>::_build_output_block(
     return Status::OK();
 }
 
-template <typename DependencyType, typename Derived>
-void JoinProbeLocalState<DependencyType, Derived>::_reset_tuple_is_null_column() {
+template <typename SharedStateArg, typename Derived>
+void JoinProbeLocalState<SharedStateArg, Derived>::_reset_tuple_is_null_column() {
     if (Base::_parent->template cast<typename Derived::Parent>()._is_outer_join) {
         reinterpret_cast<vectorized::ColumnUInt8&>(*_tuple_is_null_left_flag_column).clear();
         reinterpret_cast<vectorized::ColumnUInt8&>(*_tuple_is_null_right_flag_column).clear();
@@ -231,10 +234,14 @@ Status JoinProbeOperatorX<LocalStateType>::open(doris::RuntimeState* state) {
     return vectorized::VExpr::open(_output_expr_ctxs, state);
 }
 
-template class JoinProbeLocalState<HashJoinProbeDependency, HashJoinProbeLocalState>;
+template class JoinProbeLocalState<HashJoinSharedState, HashJoinProbeLocalState>;
 template class JoinProbeOperatorX<HashJoinProbeLocalState>;
 
-template class JoinProbeLocalState<NestedLoopJoinProbeDependency, NestedLoopJoinProbeLocalState>;
+template class JoinProbeLocalState<NestedLoopJoinSharedState, NestedLoopJoinProbeLocalState>;
 template class JoinProbeOperatorX<NestedLoopJoinProbeLocalState>;
+
+template class JoinProbeLocalState<PartitionedHashJoinSharedState,
+                                   PartitionedHashJoinProbeLocalState>;
+template class JoinProbeOperatorX<PartitionedHashJoinProbeLocalState>;
 
 } // namespace doris::pipeline

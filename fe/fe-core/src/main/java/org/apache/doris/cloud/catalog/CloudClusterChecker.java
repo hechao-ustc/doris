@@ -52,8 +52,11 @@ import java.util.stream.Collectors;
 public class CloudClusterChecker extends MasterDaemon {
     private static final Logger LOG = LogManager.getLogger(CloudClusterChecker.class);
 
-    public CloudClusterChecker() {
+    private CloudSystemInfoService cloudSystemInfoService;
+
+    public CloudClusterChecker(CloudSystemInfoService cloudSystemInfoService) {
         super("cloud cluster check", Config.cloud_cluster_check_interval_second * 1000L);
+        this.cloudSystemInfoService = cloudSystemInfoService;
     }
 
     /**
@@ -74,7 +77,9 @@ public class CloudClusterChecker extends MasterDaemon {
         Map<String, T> currentMap = supplierCurrentMapFunc.get();
         Map<String, T> nodeMap = supplierNodeMapFunc.get();
 
-        LOG.debug("current Nodes={} expected Nodes={}", currentMap.keySet(), nodeMap.keySet());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("current Nodes={} expected Nodes={}", currentMap.keySet(), nodeMap.keySet());
+        }
 
         toDel.addAll(currentMap.keySet().stream().filter(i -> !nodeMap.containsKey(i))
                 .map(currentMap::get).collect(Collectors.toList()));
@@ -88,7 +93,9 @@ public class CloudClusterChecker extends MasterDaemon {
                 .filter(i -> !localClusterIds.contains(i)).collect(Collectors.toList());
         toAddClusterIds.forEach(
                 addId -> {
-                LOG.debug("begin to add clusterId: {}", addId);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("begin to add clusterId: {}", addId);
+                }
                 // Attach tag to BEs
                 Map<String, String> newTagMap = Tag.DEFAULT_BACKEND_TAG.toMap();
                 String clusterName = remoteClusterIdToPB.get(addId).getClusterName();
@@ -117,7 +124,7 @@ public class CloudClusterChecker extends MasterDaemon {
                     b.setTagMap(newTagMap);
                     toAdd.add(b);
                 }
-                Env.getCurrentSystemInfo().updateCloudBackends(toAdd, new ArrayList<>());
+                cloudSystemInfoService.updateCloudBackends(toAdd, new ArrayList<>());
             }
         );
     }
@@ -130,18 +137,20 @@ public class CloudClusterChecker extends MasterDaemon {
         Map<String, List<Backend>> finalClusterIdToBackend = clusterIdToBackend;
         toDelClusterIds.forEach(
                 delId -> {
-                LOG.debug("begin to drop clusterId: {}", delId);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("begin to drop clusterId: {}", delId);
+                }
                 List<Backend> toDel =
                         new ArrayList<>(finalClusterIdToBackend.getOrDefault(delId, new ArrayList<>()));
-                Env.getCurrentSystemInfo().updateCloudBackends(new ArrayList<>(), toDel);
+                cloudSystemInfoService.updateCloudBackends(new ArrayList<>(), toDel);
                 // del clusterName
-                String delClusterName = Env.getCurrentSystemInfo().getClusterNameByClusterId(delId);
+                String delClusterName = cloudSystemInfoService.getClusterNameByClusterId(delId);
                 if (delClusterName.isEmpty()) {
                     LOG.warn("can't get delClusterName, clusterId: {}, plz check", delId);
                     return;
                 }
                 // del clusterID
-                Env.getCurrentSystemInfo().dropCluster(delId, delClusterName);
+                cloudSystemInfoService.dropCluster(delId, delClusterName);
             }
         );
     }
@@ -202,17 +211,19 @@ public class CloudClusterChecker extends MasterDaemon {
                 // change all be's cluster_name
                 currentBes.forEach(b -> b.setCloudClusterName(newClusterName));
                 // update clusterNameToId
-                Env.getCurrentSystemInfo().updateClusterNameToId(newClusterName, currentClusterName, cid);
+                cloudSystemInfoService.updateClusterNameToId(newClusterName, currentClusterName, cid);
                 // update tags
                 currentBes.forEach(b -> Env.getCurrentEnv().getEditLog().logModifyBackend(b));
             }
 
-            String currentClusterStatus = Env.getCurrentSystemInfo().getCloudStatusById(cid);
+            String currentClusterStatus = cloudSystemInfoService.getCloudStatusById(cid);
 
             // For old versions that do no have status field set
             ClusterStatus clusterStatus = cp.hasClusterStatus() ? cp.getClusterStatus() : ClusterStatus.NORMAL;
             String newClusterStatus = String.valueOf(clusterStatus);
-            LOG.debug("current cluster status {} {}", currentClusterStatus, newClusterStatus);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("current cluster status {} {}", currentClusterStatus, newClusterStatus);
+            }
             if (!currentClusterStatus.equals(newClusterStatus)) {
                 // cluster's status changed
                 LOG.info("cluster_status corresponding to cluster_id has been changed,"
@@ -279,14 +290,18 @@ public class CloudClusterChecker extends MasterDaemon {
                 return nodeMap;
             });
 
-            LOG.debug("cluster_id: {}, diffBackends nodes: {}, current: {}, toAdd: {}, toDel: {}",
-                    cid, expectedBes, currentBes, toAdd, toDel);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("cluster_id: {}, diffBackends nodes: {}, current: {}, toAdd: {}, toDel: {}",
+                        cid, expectedBes, currentBes, toAdd, toDel);
+            }
             if (toAdd.isEmpty() && toDel.isEmpty()) {
-                LOG.debug("runAfterCatalogReady nothing todo");
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("runAfterCatalogReady nothing todo");
+                }
                 continue;
             }
 
-            Env.getCurrentSystemInfo().updateCloudBackends(toAdd, toDel);
+            cloudSystemInfoService.updateCloudBackends(toAdd, toDel);
         }
     }
 
@@ -298,8 +313,10 @@ public class CloudClusterChecker extends MasterDaemon {
     }
 
     private void checkFeNodesMapValid() {
-        LOG.debug("begin checkFeNodesMapValid");
-        Map<String, List<Backend>> clusterIdToBackend = Env.getCurrentSystemInfo().getCloudClusterIdToBackend();
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("begin checkFeNodesMapValid");
+        }
+        Map<String, List<Backend>> clusterIdToBackend = cloudSystemInfoService.getCloudClusterIdToBackend();
         Set<String> clusterIds = new HashSet<>();
         Set<String> clusterNames = new HashSet<>();
         clusterIdToBackend.forEach((clusterId, bes) -> {
@@ -313,7 +330,7 @@ public class CloudClusterChecker extends MasterDaemon {
             });
         });
 
-        Map<String, String> nameToId = Env.getCurrentSystemInfo().getCloudClusterNameToId();
+        Map<String, String> nameToId = cloudSystemInfoService.getCloudClusterNameToId();
         nameToId.forEach((clusterName, clusterId) -> {
             if (!clusterIdToBackend.containsKey(clusterId)) {
                 LOG.warn("impossible, somewhere err, clusterId {}, clusterName {}, clusterNameToIdMap {}",
@@ -354,7 +371,10 @@ public class CloudClusterChecker extends MasterDaemon {
         }
 
         ClusterPB cpb = response.getCluster(0);
-        LOG.debug("get cloud cluster, clusterId={} nodes={}", Config.cloud_sql_server_cluster_id, cpb.getNodesList());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("get cloud cluster, clusterId={} nodes={}",
+                    Config.cloud_sql_server_cluster_id, cpb.getNodesList());
+        }
         List<Frontend> currentFes = Env.getCurrentEnv().getFrontends(FrontendNodeType.OBSERVER);
         List<Frontend> toAdd = new ArrayList<>();
         List<Frontend> toDel = new ArrayList<>();
@@ -393,7 +413,9 @@ public class CloudClusterChecker extends MasterDaemon {
         LOG.info("diffFrontends nodes: {}, current: {}, toAdd: {}, toDel: {}",
                 expectedFes, currentFes, toAdd, toDel);
         if (toAdd.isEmpty() && toDel.isEmpty()) {
-            LOG.debug("runAfterCatalogReady getObserverFes nothing todo");
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("runAfterCatalogReady getObserverFes nothing todo");
+            }
             return;
         }
         try {
@@ -404,7 +426,7 @@ public class CloudClusterChecker extends MasterDaemon {
     }
 
     private void getCloudBackends() {
-        Map<String, List<Backend>> clusterIdToBackend = Env.getCurrentSystemInfo().getCloudClusterIdToBackend();
+        Map<String, List<Backend>> clusterIdToBackend = cloudSystemInfoService.getCloudClusterIdToBackend();
         //rpc to ms, to get mysql user can use cluster_id
         // NOTE: rpc args all empty, use cluster_unique_id to get a instance's all cluster info.
         Cloud.GetClusterResponse response = CloudSystemInfoService.getCloudCluster("", "", "");
@@ -443,14 +465,14 @@ public class CloudClusterChecker extends MasterDaemon {
             LOG.warn("diff cluster has exception, {}", e.getMessage(), e);
 
         }
-        LOG.info("daemon cluster get cluster info succ, current cloudClusterIdToBackendMap: {}",
-                Env.getCurrentSystemInfo().getCloudClusterIdToBackend());
+        LOG.info("daemon cluster get cluster info succ, current cloudClusterIdToBackendMap: {} clusterNameToId {}",
+                cloudSystemInfoService.getCloudClusterIdToBackend(), cloudSystemInfoService.getCloudClusterNameToId());
     }
 
     private void updateCloudMetrics() {
         // Metric
-        Map<String, List<Backend>> clusterIdToBackend = Env.getCurrentSystemInfo().getCloudClusterIdToBackend();
-        Map<String, String> clusterNameToId = Env.getCurrentSystemInfo().getCloudClusterNameToId();
+        Map<String, List<Backend>> clusterIdToBackend = cloudSystemInfoService.getCloudClusterIdToBackend();
+        Map<String, String> clusterNameToId = cloudSystemInfoService.getCloudClusterNameToId();
         for (Map.Entry<String, String> entry : clusterNameToId.entrySet()) {
             long aliveNum = 0L;
             List<Backend> bes = clusterIdToBackend.get(entry.getValue());
@@ -482,4 +504,3 @@ public class CloudClusterChecker extends MasterDaemon {
         }
     }
 }
-

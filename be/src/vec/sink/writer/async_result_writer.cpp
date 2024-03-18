@@ -17,6 +17,7 @@
 
 #include "async_result_writer.h"
 
+#include "common/status.h"
 #include "pipeline/pipeline_x/dependency.h"
 #include "runtime/exec_env.h"
 #include "runtime/fragment_mgr.h"
@@ -86,21 +87,34 @@ std::unique_ptr<Block> AsyncResultWriter::_get_block_from_queue() {
     return block;
 }
 
-void AsyncResultWriter::start_writer(RuntimeState* state, RuntimeProfile* profile) {
+Status AsyncResultWriter::start_writer(RuntimeState* state, RuntimeProfile* profile) {
     // Should set to false here, to
     _writer_thread_closed = false;
     // This is a async thread, should lock the task ctx, to make sure runtimestate and profile
     // not deconstructed before the thread exit.
     auto task_ctx = state->get_task_execution_context();
-    static_cast<void>(ExecEnv::GetInstance()->fragment_mgr()->get_thread_pool()->submit_func(
-            [this, state, profile, task_ctx]() {
-                auto task_lock = task_ctx.lock();
-                if (task_lock == nullptr) {
-                    _writer_thread_closed = true;
-                    return;
-                }
-                this->process_block(state, profile);
-            }));
+    if (state->get_query_ctx() && state->get_query_ctx()->get_non_pipe_exec_thread_pool()) {
+        ThreadPool* pool_ptr = state->get_query_ctx()->get_non_pipe_exec_thread_pool();
+        RETURN_IF_ERROR(pool_ptr->submit_func([this, state, profile, task_ctx]() {
+            auto task_lock = task_ctx.lock();
+            if (task_lock == nullptr) {
+                _writer_thread_closed = true;
+                return;
+            }
+            this->process_block(state, profile);
+        }));
+    } else {
+        RETURN_IF_ERROR(ExecEnv::GetInstance()->fragment_mgr()->get_thread_pool()->submit_func(
+                [this, state, profile, task_ctx]() {
+                    auto task_lock = task_ctx.lock();
+                    if (task_lock == nullptr) {
+                        _writer_thread_closed = true;
+                        return;
+                    }
+                    this->process_block(state, profile);
+                }));
+    }
+    return Status::OK();
 }
 
 void AsyncResultWriter::process_block(RuntimeState* state, RuntimeProfile* profile) {
@@ -113,7 +127,8 @@ void AsyncResultWriter::process_block(RuntimeState* state, RuntimeProfile* profi
             if (!_eos && _data_queue.empty() && _writer_status.ok()) {
                 std::unique_lock l(_m);
                 while (!_eos && _data_queue.empty() && _writer_status.ok()) {
-                    _cv.wait(l);
+                    // Add 1s to check to avoid lost signal
+                    _cv.wait_for(l, std::chrono::seconds(1));
                 }
             }
 
@@ -148,6 +163,10 @@ void AsyncResultWriter::process_block(RuntimeState* state, RuntimeProfile* profi
     if (_writer_status.ok() && _eos) {
         _writer_status = finish(state);
     }
+    // should set _finish_dependency first, as close function maybe blocked by wait_close of execution_timeout
+    if (_finish_dependency) {
+        _finish_dependency->set_ready();
+    }
 
     Status close_st = close(_writer_status);
     // If it is already failed before, then not update the write status so that we could get
@@ -156,9 +175,6 @@ void AsyncResultWriter::process_block(RuntimeState* state, RuntimeProfile* profi
         _writer_status = close_st;
     }
     _writer_thread_closed = true;
-    if (_finish_dependency) {
-        _finish_dependency->set_ready();
-    }
 }
 
 Status AsyncResultWriter::_projection_block(doris::vectorized::Block& input_block,

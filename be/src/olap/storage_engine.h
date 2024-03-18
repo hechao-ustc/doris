@@ -121,12 +121,22 @@ public:
     RowsetId next_rowset_id();
 
     MemTableFlushExecutor* memtable_flush_executor() { return _memtable_flush_executor.get(); }
+    CalcDeleteBitmapExecutor* calc_delete_bitmap_executor() {
+        return _calc_delete_bitmap_executor.get();
+    }
 
     const std::shared_ptr<MemTracker>& segment_meta_mem_tracker() {
         return _segment_meta_mem_tracker;
     }
 
+    void add_quering_rowset(RowsetSharedPtr rs);
+
+    RowsetSharedPtr get_quering_rowset(RowsetId rs_id);
+
 protected:
+    void _evict_querying_rowset();
+    void _evict_quring_rowset_thread_callback();
+
     int32_t _effective_cluster_id = -1;
     HeartbeatFlags* _heartbeat_flags = nullptr;
 
@@ -136,6 +146,8 @@ protected:
 
     std::unique_ptr<RowsetIdGenerator> _rowset_id_generator;
     std::unique_ptr<MemTableFlushExecutor> _memtable_flush_executor;
+    std::unique_ptr<CalcDeleteBitmapExecutor> _calc_delete_bitmap_executor;
+    CountDownLatch _stop_background_threads_latch;
 
     // This mem tracker is only for tracking memory use by segment meta data such as footer or index page.
     // The memory consumed by querying is tracked in segment iterator.
@@ -143,6 +155,11 @@ protected:
     // is similar to `-2912341218700198079`. So, temporarily put it in experimental type tracker.
     // maybe have to use ColumnReader count as segment meta size.
     std::shared_ptr<MemTracker> _segment_meta_mem_tracker;
+
+    // Hold reference of quering rowsets
+    std::mutex _quering_rowsets_mutex;
+    std::unordered_map<RowsetId, RowsetSharedPtr> _querying_rowsets;
+    scoped_refptr<Thread> _evict_quering_rowset_thread;
 };
 
 class StorageEngine final : public BaseStorageEngine {
@@ -203,10 +220,6 @@ public:
     TxnManager* txn_manager() { return _txn_manager.get(); }
     SnapshotManager* snapshot_mgr() { return _snapshot_mgr.get(); }
     MemTableFlushExecutor* memtable_flush_executor() { return _memtable_flush_executor.get(); }
-    CalcDeleteBitmapExecutor* calc_delete_bitmap_executor() {
-        return _calc_delete_bitmap_executor.get();
-    }
-
     // Rowset garbage collection helpers
     bool check_rowset_id_in_unused_rowsets(const RowsetId& rowset_id);
     PendingRowsetSet& pending_local_rowsets() { return _pending_local_rowsets; }
@@ -265,12 +278,6 @@ public:
     void add_async_publish_task(int64_t partition_id, int64_t tablet_id, int64_t publish_version,
                                 int64_t transaction_id, bool is_recover);
     int64_t get_pending_publish_min_version(int64_t tablet_id);
-
-    void add_quering_rowset(RowsetSharedPtr rs);
-
-    RowsetSharedPtr get_quering_rowset(RowsetId rs_id);
-
-    void evict_querying_rowset(RowsetId rs_id);
 
     bool add_broken_path(std::string path);
     bool remove_broken_path(std::string path);
@@ -402,18 +409,13 @@ private:
     std::atomic_bool _stopped {false};
 
     std::mutex _gc_mutex;
-    std::unordered_map<RowsetId, RowsetSharedPtr, HashOfRowsetId> _unused_rowsets;
+    std::unordered_map<RowsetId, RowsetSharedPtr> _unused_rowsets;
     PendingRowsetSet _pending_local_rowsets;
     PendingRowsetSet _pending_remote_rowsets;
-
-    // Hold reference of quering rowsets
-    std::mutex _quering_rowsets_mutex;
-    std::unordered_map<RowsetId, RowsetSharedPtr, HashOfRowsetId> _querying_rowsets;
 
     // Count the memory consumption of segment compaction tasks.
     std::shared_ptr<MemTracker> _segcompaction_mem_tracker;
 
-    CountDownLatch _stop_background_threads_latch;
     scoped_refptr<Thread> _unused_rowset_monitor_thread;
     // thread to monitor snapshot expiry
     scoped_refptr<Thread> _garbage_sweeper_thread;
@@ -438,8 +440,6 @@ private:
 
     std::unique_ptr<TabletManager> _tablet_manager;
     std::unique_ptr<TxnManager> _txn_manager;
-
-    std::unique_ptr<CalcDeleteBitmapExecutor> _calc_delete_bitmap_executor;
 
     // Used to control the migration from segment_v1 to segment_v2, can be deleted in futrue.
     // Type of new loaded data
@@ -500,6 +500,7 @@ private:
     std::shared_mutex _async_publish_lock;
 
     bool _clear_segment_cache = false;
+    bool _clear_page_cache = false;
 
     std::atomic<bool> _need_clean_trash {false};
 
@@ -526,7 +527,10 @@ public:
 
     void set_index(const std::string& key, int next_idx);
 
-    struct CacheValue : public LRUCacheValueBase {
+    class CacheValue : public LRUCacheValueBase {
+    public:
+        CacheValue() : LRUCacheValueBase(CachePolicy::CacheType::CREATE_TABLET_RR_IDX_CACHE) {}
+
         int idx = 0;
     };
 

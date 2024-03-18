@@ -193,6 +193,7 @@ Status BaseTabletsChannel::incremental_open(const PTabletWriterOpenRequest& para
         wrequest.is_high_priority = _is_high_priority;
         wrequest.table_schema_param = _schema;
         wrequest.txn_expiration = params.txn_expiration(); // Required by CLOUD.
+        wrequest.storage_vault_id = params.storage_vault_id();
 
         auto delta_writer = create_delta_writer(wrequest);
         {
@@ -524,7 +525,7 @@ Status BaseTabletsChannel::_write_block_data(
     Defer defer {
             [&]() { g_tablets_channel_send_data_allocated_size << -send_data.allocated_bytes(); }};
 
-    auto write_tablet_data = [&](uint32_t tablet_id,
+    auto write_tablet_data = [&](int64_t tablet_id,
                                  std::function<Status(BaseDeltaWriter * writer)> write_func) {
         google::protobuf::RepeatedPtrField<PTabletError>* tablet_errors =
                 response->mutable_tablet_errors();
@@ -611,10 +612,13 @@ void BaseTabletsChannel::_build_tablet_to_rowidxs(
     // tests show that a relatively coarse-grained read lock here performs better under multicore scenario
     // see: https://github.com/apache/doris/pull/28552
     std::shared_lock<std::shared_mutex> rlock(_broken_tablets_lock);
+    if (request.is_single_tablet_block()) {
+        // The cloud mode need the tablet ids to prepare rowsets.
+        int64_t tablet_id = request.tablet_ids(0);
+        tablet_to_rowidxs->emplace(tablet_id, std::initializer_list<uint32_t> {0});
+        return;
+    }
     for (uint32_t i = 0; i < request.tablet_ids_size(); ++i) {
-        if (request.is_single_tablet_block()) {
-            break;
-        }
         int64_t tablet_id = request.tablet_ids(i);
         if (_is_broken_tablet(tablet_id)) {
             // skip broken tablets

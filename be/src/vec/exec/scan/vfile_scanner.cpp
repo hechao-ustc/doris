@@ -35,7 +35,7 @@
 #include "common/config.h"
 #include "common/logging.h"
 #include "common/object_pool.h"
-#include "io/cache/block/block_file_cache_profile.h"
+#include "io/cache/block_file_cache_profile.h"
 #include "runtime/descriptors.h"
 #include "runtime/runtime_state.h"
 #include "runtime/types.h"
@@ -64,6 +64,7 @@
 #include "vec/exec/format/table/max_compute_jni_reader.h"
 #include "vec/exec/format/table/paimon_reader.h"
 #include "vec/exec/format/table/transactional_hive_reader.h"
+#include "vec/exec/format/table/trino_connector_jni_reader.h"
 #include "vec/exec/format/wal/wal_reader.h"
 #include "vec/exec/scan/new_file_scan_node.h"
 #include "vec/exec/scan/vscan_node.h"
@@ -698,6 +699,11 @@ Status VFileScanner::_truncate_char_or_varchar_columns(Block* block) {
 void VFileScanner::_truncate_char_or_varchar_column(Block* block, int idx, int len) {
     auto int_type = std::make_shared<DataTypeInt32>();
     size_t num_columns_without_result = block->columns();
+    const ColumnNullable* col_nullable =
+            assert_cast<const ColumnNullable*>(block->get_by_position(idx).column.get());
+    const ColumnPtr& string_column_ptr = col_nullable->get_nested_column_ptr();
+    ColumnPtr null_map_column_ptr = col_nullable->get_null_map_column_ptr();
+    block->replace_by_position(idx, std::move(string_column_ptr));
     block->insert({int_type->create_column_const(block->rows(), to_field(1)), int_type,
                    "const 1"}); // pos is 1
     block->insert({int_type->create_column_const(block->rows(), to_field(len)), int_type,
@@ -708,14 +714,18 @@ void VFileScanner::_truncate_char_or_varchar_column(Block* block, int idx, int l
     temp_arguments[1] = num_columns_without_result;     // pos
     temp_arguments[2] = num_columns_without_result + 1; // len
     size_t result_column_id = num_columns_without_result + 2;
+
     SubstringUtil::substring_execute(*block, temp_arguments, result_column_id, block->rows());
-    block->replace_by_position(idx, block->get_by_position(result_column_id).column);
+    auto res = ColumnNullable::create(block->get_by_position(result_column_id).column,
+                                      null_map_column_ptr);
+    block->replace_by_position(idx, std::move(res));
     Block::erase_useless_column(block, num_columns_without_result);
 }
 
 Status VFileScanner::_get_next_reader() {
     while (true) {
         if (_cur_reader) {
+            _cur_reader->collect_profile_before_close();
             RETURN_IF_ERROR(_cur_reader->close());
         }
         _cur_reader.reset(nullptr);
@@ -781,6 +791,12 @@ Status VFileScanner::_get_next_reader() {
                                                            _file_slot_descs, _state, _profile);
                 init_status =
                         ((HudiJniReader*)_cur_reader.get())->init_reader(_colname_to_value_range);
+            } else if (range.__isset.table_format_params &&
+                       range.table_format_params.table_format_type == "trino_connector") {
+                _cur_reader = TrinoConnectorJniReader::create_unique(_file_slot_descs, _state,
+                                                                     _profile, range);
+                init_status = ((TrinoConnectorJniReader*)(_cur_reader.get()))
+                                      ->init_reader(_colname_to_value_range);
             }
             break;
         }
@@ -799,9 +815,8 @@ Status VFileScanner::_get_next_reader() {
             std::unique_ptr<ParquetReader> parquet_reader = ParquetReader::create_unique(
                     _profile, *_params, range, _state->query_options().batch_size, tz,
                     _io_ctx.get(), _state,
-                    config::max_external_file_meta_cache_num <= 0
-                            ? nullptr
-                            : ExecEnv::GetInstance()->file_meta_cache(),
+                    _shoudl_enable_file_meta_cache() ? ExecEnv::GetInstance()->file_meta_cache()
+                                                     : nullptr,
                     _state->query_options().enable_parquet_lazy_mat);
             {
                 SCOPED_TIMER(_open_reader_timer);
@@ -916,6 +931,7 @@ Status VFileScanner::_get_next_reader() {
             return Status::InternalError("Not supported file format: {}", _params->format_type);
         }
 
+        COUNTER_UPDATE(_file_counter, 1);
         if (init_status.is<END_OF_FILE>()) {
             COUNTER_UPDATE(_empty_file_counter, 1);
             continue;
@@ -928,7 +944,6 @@ Status VFileScanner::_get_next_reader() {
             return Status::InternalError("failed to init reader for file {}, err: {}", range.path,
                                          init_status.to_string());
         }
-        COUNTER_UPDATE(_file_counter, 1);
 
         _name_to_col_type.clear();
         _missing_cols.clear();
@@ -1129,11 +1144,6 @@ Status VFileScanner::close(RuntimeState* state) {
         return Status::OK();
     }
 
-    if (config::enable_file_cache && _state->query_options().enable_file_cache) {
-        io::FileCacheProfileReporter cache_profile(_profile);
-        cache_profile.update(_file_cache_statistics.get());
-    }
-
     if (_cur_reader) {
         RETURN_IF_ERROR(_cur_reader->close());
     }
@@ -1146,6 +1156,19 @@ void VFileScanner::try_stop() {
     VScanner::try_stop();
     if (_io_ctx) {
         _io_ctx->should_stop = true;
+    }
+}
+
+void VFileScanner::_collect_profile_before_close() {
+    VScanner::_collect_profile_before_close();
+    if (config::enable_file_cache && _state->query_options().enable_file_cache &&
+        _profile != nullptr) {
+        io::FileCacheProfileReporter cache_profile(_profile);
+        cache_profile.update(_file_cache_statistics.get());
+    }
+
+    if (_cur_reader != nullptr) {
+        _cur_reader->collect_profile_before_close();
     }
 }
 

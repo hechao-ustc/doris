@@ -20,6 +20,7 @@ package org.apache.doris.transaction;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.Table;
+import org.apache.doris.cloud.proto.Cloud.CommitTxnResponse;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DuplicatedRequestException;
 import org.apache.doris.common.LabelAlreadyUsedException;
@@ -39,6 +40,7 @@ import org.apache.doris.transaction.TransactionState.TxnCoordinator;
 import java.io.DataInput;
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeoutException;
 
 public interface GlobalTransactionMgrIface extends Writable {
@@ -122,9 +124,6 @@ public interface GlobalTransactionMgrIface extends Writable {
     public void updateMultiTableRunningTransactionTableIds(Long dbId, Long transactionId, List<Long> tableIds)
             throws UserException;
 
-    public void putTransactionTableNames(Long dbId, Long transactionId, List<Long> tableIds)
-            throws Exception;
-
     public TWaitingTxnStatusResult getWaitingTxnStatus(TWaitingTxnStatusRequest request)
             throws AnalysisException, TimeoutException;
 
@@ -155,6 +154,8 @@ public interface GlobalTransactionMgrIface extends Writable {
 
     public List<List<String>> getDbTransInfo(Long dbId, boolean running, int limit) throws AnalysisException;
 
+    public Map<Long, List<Long>> getDbRunningTransInfo(long dbId) throws AnalysisException;
+
     public List<List<Comparable>> getTableTransInfo(long dbId, long txnId) throws AnalysisException;
 
     public List<List<Comparable>> getPartitionTransInfo(long dbId, long tid, long tableId)
@@ -183,4 +184,6 @@ public interface GlobalTransactionMgrIface extends Writable {
     public void replayBatchRemoveTransactions(BatchRemoveTransactionsOperation operation) throws Exception;
 
     public void replayBatchRemoveTransactionV2(BatchRemoveTransactionsOperationV2 operation) throws Exception;
+
+    public void afterCommitTxnResp(CommitTxnResponse commitTxnResponse);
 }

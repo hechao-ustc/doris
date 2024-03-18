@@ -62,7 +62,7 @@ public class ColumnDefinition {
     private final String comment;
     private final boolean isVisible;
     private boolean aggTypeImplicit = false;
-    private boolean isAutoInc = false;
+    private long autoIncInitValue = -1;
     private int clusterKeyId = -1;
 
     public ColumnDefinition(String name, DataType type, boolean isKey, AggregateType aggType, boolean isNullable,
@@ -71,9 +71,9 @@ public class ColumnDefinition {
     }
 
     public ColumnDefinition(String name, DataType type, boolean isKey, AggregateType aggType,
-            boolean isNullable, boolean isAutoInc, Optional<DefaultValue> defaultValue,
+            boolean isNullable, long autoIncInitValue, Optional<DefaultValue> defaultValue,
             Optional<DefaultValue> onUpdateDefaultValue, String comment) {
-        this(name, type, isKey, aggType, isNullable, isAutoInc, defaultValue, onUpdateDefaultValue,
+        this(name, type, isKey, aggType, isNullable, autoIncInitValue, defaultValue, onUpdateDefaultValue,
                 comment, true);
     }
 
@@ -96,14 +96,14 @@ public class ColumnDefinition {
      * constructor
      */
     private ColumnDefinition(String name, DataType type, boolean isKey, AggregateType aggType,
-            boolean isNullable, boolean isAutoInc, Optional<DefaultValue> defaultValue,
+            boolean isNullable, long autoIncInitValue, Optional<DefaultValue> defaultValue,
             Optional<DefaultValue> onUpdateDefaultValue, String comment, boolean isVisible) {
         this.name = name;
         this.type = type;
         this.isKey = isKey;
         this.aggType = aggType;
         this.isNullable = isNullable;
-        this.isAutoInc = isAutoInc;
+        this.autoIncInitValue = autoIncInitValue;
         this.defaultValue = defaultValue;
         this.onUpdateDefaultValue = onUpdateDefaultValue;
         this.comment = comment;
@@ -148,10 +148,6 @@ public class ColumnDefinition {
 
     public void setClusterKeyId(int clusterKeyId) {
         this.clusterKeyId = clusterKeyId;
-    }
-
-    public boolean isAutoInc() {
-        return isAutoInc;
     }
 
     private DataType updateCharacterTypeLength(DataType dataType) {
@@ -250,6 +246,20 @@ public class ColumnDefinition {
             }
         }
 
+        if (aggType != null) {
+            // check if aggregate type is valid
+            if (aggType != AggregateType.GENERIC
+                    && !aggType.checkCompatibility(type.toCatalogDataType().getPrimitiveType())) {
+                throw new AnalysisException(String.format("Aggregate type %s is not compatible with primitive type %s",
+                        aggType, type.toSql()));
+            }
+            if (aggType == AggregateType.GENERIC) {
+                if (!SessionVariable.enableAggState()) {
+                    throw new AnalysisException("agg state not enable, need set enable_agg_state=true");
+                }
+            }
+        }
+
         if (isOlap) {
             if (!isKey && keysType.equals(KeysType.UNIQUE_KEYS)) {
                 aggTypeImplicit = true;
@@ -338,44 +348,34 @@ public class ColumnDefinition {
 
         // from old planner CreateTableStmt's analyze method, after call columnDef.analyze(engineName.equals("olap"));
         if (isOlap && type.isComplexType()) {
-            if (aggType != null && aggType != AggregateType.NONE
-                    && aggType != AggregateType.REPLACE) {
-                throw new AnalysisException(type.toCatalogDataType().getPrimitiveType()
-                        + " column can't support aggregation " + aggType);
-            }
             if (isKey) {
                 throw new AnalysisException(type.toCatalogDataType().getPrimitiveType()
-                        + " can only be used in the non-key column of the duplicate table at present.");
+                        + " can only be used in the non-key column at present.");
+            }
+            if (type.isAggStateType()) {
+                if (aggType == null) {
+                    throw new AnalysisException(type.toCatalogDataType().getPrimitiveType()
+                            + " column must have aggregation type");
+                } else {
+                    if (aggType != AggregateType.GENERIC
+                            && aggType != AggregateType.NONE
+                            && aggType != AggregateType.REPLACE) {
+                        throw new AnalysisException(type.toCatalogDataType().getPrimitiveType()
+                                + " column can't support aggregation " + aggType);
+                    }
+                }
+                isNullable = false;
+            } else {
+                if (aggType != null && aggType != AggregateType.NONE && aggType != AggregateType.REPLACE) {
+                    throw new AnalysisException(type.toCatalogDataType().getPrimitiveType()
+                            + " column can't support aggregation " + aggType);
+                }
             }
         }
 
         if (type.isTimeLikeType()) {
             throw new AnalysisException("Time type is not supported for olap table");
         }
-    }
-
-    /**
-     * check if is nested complex type.
-     */
-    private boolean isNestedComplexType(DataType dataType) {
-        if (!dataType.isComplexType()) {
-            return false;
-        }
-        if (dataType instanceof ArrayType) {
-            if (((ArrayType) dataType).getItemType() instanceof ArrayType) {
-                return isNestedComplexType(((ArrayType) dataType).getItemType());
-            } else {
-                return ((ArrayType) dataType).getItemType().isComplexType();
-            }
-        }
-        if (dataType instanceof MapType) {
-            return ((MapType) dataType).getKeyType().isComplexType()
-                    || ((MapType) dataType).getValueType().isComplexType();
-        }
-        if (dataType instanceof StructType) {
-            return ((StructType) dataType).getFields().stream().anyMatch(f -> f.getDataType().isComplexType());
-        }
-        return false;
     }
 
     // from TypeDef.java analyze()
@@ -619,7 +619,7 @@ public class ColumnDefinition {
      */
     public Column translateToCatalogStyle() {
         Column column = new Column(name, type.toCatalogDataType(), isKey, aggType, isNullable,
-                isAutoInc, defaultValue.map(DefaultValue::getRawValue).orElse(null), comment, isVisible,
+                autoIncInitValue, defaultValue.map(DefaultValue::getRawValue).orElse(null), comment, isVisible,
                 defaultValue.map(DefaultValue::getDefaultValueExprDef).orElse(null), Column.COLUMN_UNIQUE_ID_INIT_VALUE,
                 defaultValue.map(DefaultValue::getValue).orElse(null), onUpdateDefaultValue.isPresent(),
                 onUpdateDefaultValue.map(DefaultValue::getDefaultValueExprDef).orElse(null), clusterKeyId);

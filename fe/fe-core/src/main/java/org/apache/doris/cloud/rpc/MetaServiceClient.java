@@ -93,7 +93,9 @@ public class MetaServiceClient {
     public void shutdown(boolean debugLog) {
         channel.shutdown();
         if (debugLog) {
-            LOG.debug("shut down meta service client: {}", address);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("shut down meta service client: {}", address);
+            }
         } else {
             LOG.warn("shut down meta service client: {}", address);
         }
@@ -292,6 +294,16 @@ public class MetaServiceClient {
 
     public Cloud.AlterClusterResponse alterCluster(Cloud.AlterClusterRequest request) {
         return blockingStub.alterCluster(request);
+    }
+
+    public Cloud.AlterObjStoreInfoResponse alterObjStoreInfo(Cloud.AlterObjStoreInfoRequest request) {
+        if (!request.hasCloudUniqueId()) {
+            Cloud.AlterObjStoreInfoRequest.Builder builder =
+                    Cloud.AlterObjStoreInfoRequest.newBuilder();
+            builder.mergeFrom(request);
+            return blockingStub.alterObjStoreInfo(builder.setCloudUniqueId(Config.cloud_unique_id).build());
+        }
+        return blockingStub.alterObjStoreInfo(request);
     }
 
     public Cloud.GetDeleteBitmapUpdateLockResponse

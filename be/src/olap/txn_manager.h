@@ -126,6 +126,13 @@ public:
         delete[] _txn_tablet_delta_writer_map_locks;
     }
 
+    class CacheValue : public LRUCacheValueBase {
+    public:
+        CacheValue() : LRUCacheValueBase(CachePolicy::CacheType::TABLET_VERSION_CACHE) {}
+
+        int64_t value;
+    };
+
     // add a txn to manager
     // partition id is useful in publish version stage because version is associated with partition
     Status prepare_txn(TPartitionId partition_id, const Tablet& tablet,
@@ -208,7 +215,7 @@ public:
                                        const RowsetIdUnorderedSet& rowset_ids,
                                        std::shared_ptr<PartialUpdateInfo> partial_update_info);
     void get_all_commit_tablet_txn_info_by_tablet(
-            const TabletSharedPtr& tablet, CommitTabletTxnInfoVec* commit_tablet_txn_info_vec);
+            const Tablet& tablet, CommitTabletTxnInfoVec* commit_tablet_txn_info_vec);
 
     int64_t get_txn_by_tablet_version(int64_t tablet_id, int64_t version);
     void update_tablet_version_txn(int64_t tablet_id, int64_t version, int64_t txn_id);

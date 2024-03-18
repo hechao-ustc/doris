@@ -20,15 +20,15 @@ package org.apache.doris.cloud.common.util;
 import org.apache.doris.catalog.DynamicPartitionProperty;
 import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.common.util.PropertyAnalyzer;
-import org.apache.doris.common.util.PropertyAnalyzer.RewriteProperty;
 
 import com.google.common.collect.ImmutableList;
 
 public class CloudPropertyAnalyzer extends PropertyAnalyzer {
 
     public CloudPropertyAnalyzer() {
+        // Ignore unsupported properties in cloud mode
         forceProperties = ImmutableList.of(
-                RewriteProperty.replace(PropertyAnalyzer.PROPERTIES_INMEMORY, "true"),
+                RewriteProperty.delete(PropertyAnalyzer.PROPERTIES_INMEMORY),
                 RewriteProperty.delete(PropertyAnalyzer.PROPERTIES_STORAGE_MEDIUM),
                 RewriteProperty.replace(PropertyAnalyzer.PROPERTIES_STORAGE_FORMAT, "V2"),
                 RewriteProperty.delete(PropertyAnalyzer.PROPERTIES_STORAGE_POLICY),
@@ -40,6 +40,8 @@ public class CloudPropertyAnalyzer extends PropertyAnalyzer {
                         String.valueOf(ReplicaAllocation.DEFAULT_ALLOCATION.getTotalReplicaNum())),
                 RewriteProperty.replace(PropertyAnalyzer.PROPERTIES_REPLICATION_ALLOCATION,
                         ReplicaAllocation.DEFAULT_ALLOCATION.toCreateStmt()),
+                RewriteProperty.delete("default." + PropertyAnalyzer.PROPERTIES_REPLICATION_NUM),
+                RewriteProperty.delete("default." + PropertyAnalyzer.PROPERTIES_REPLICATION_ALLOCATION),
                 RewriteProperty.delete(DynamicPartitionProperty.STORAGE_MEDIUM),
                 RewriteProperty.replace(DynamicPartitionProperty.REPLICATION_NUM,
                         String.valueOf(ReplicaAllocation.DEFAULT_ALLOCATION.getTotalReplicaNum())),

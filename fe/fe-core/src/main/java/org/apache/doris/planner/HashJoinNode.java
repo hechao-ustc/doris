@@ -199,12 +199,6 @@ public class HashJoinNode extends JoinNodeBase {
         for (Expr eqJoinPredicate : eqJoinConjuncts) {
             Preconditions.checkArgument(eqJoinPredicate instanceof BinaryPredicate);
             BinaryPredicate eqJoin = (BinaryPredicate) eqJoinPredicate;
-            if (eqJoin.getOp().equals(BinaryPredicate.Operator.EQ_FOR_NULL)) {
-                Preconditions.checkArgument(eqJoin.getChildren().size() == 2);
-                if (!eqJoin.getChild(0).isNullable() || !eqJoin.getChild(1).isNullable()) {
-                    eqJoin.setOp(BinaryPredicate.Operator.EQ);
-                }
-            }
             this.eqJoinConjuncts.add(eqJoin);
         }
         this.distrMode = DistributionMode.NONE;
@@ -610,7 +604,9 @@ public class HashJoinNode extends JoinNodeBase {
             // numDistinct = Math.min(numDistinct, rhsTbl.getNumRows());
             // }
             maxNumDistinct = Math.max(maxNumDistinct, numDistinct);
-            LOG.debug("min slotref: {}, #distinct: {}", rhsSlotRef.toSql(), numDistinct);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("min slotref: {}, #distinct: {}", rhsSlotRef.toSql(), numDistinct);
+            }
         }
 
         if (maxNumDistinct == 0) {
@@ -621,9 +617,13 @@ public class HashJoinNode extends JoinNodeBase {
         } else {
             cardinality = Math.round(
                     (double) getChild(0).cardinality * (double) getChild(1).cardinality / (double) maxNumDistinct);
-            LOG.debug("lhs card: {}, rhs card: {}", getChild(0).cardinality, getChild(1).cardinality);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("lhs card: {}, rhs card: {}", getChild(0).cardinality, getChild(1).cardinality);
+            }
         }
-        LOG.debug("stats HashJoin: cardinality {}", cardinality);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("stats HashJoin: cardinality {}", cardinality);
+        }
     }
 
     /**
@@ -776,13 +776,8 @@ public class HashJoinNode extends JoinNodeBase {
 
         if (markJoinConjuncts != null) {
             if (eqJoinConjuncts.isEmpty()) {
-                Preconditions.checkState(joinOp == JoinOperator.LEFT_SEMI_JOIN
-                        || joinOp == JoinOperator.LEFT_ANTI_JOIN);
-                if (joinOp == JoinOperator.LEFT_SEMI_JOIN) {
-                    msg.hash_join_node.join_op = JoinOperator.NULL_AWARE_LEFT_SEMI_JOIN.toThrift();
-                } else if (joinOp == JoinOperator.LEFT_ANTI_JOIN) {
-                    msg.hash_join_node.join_op = JoinOperator.NULL_AWARE_LEFT_ANTI_JOIN.toThrift();
-                }
+                Preconditions.checkState(joinOp == JoinOperator.NULL_AWARE_LEFT_SEMI_JOIN
+                        || joinOp == JoinOperator.NULL_AWARE_LEFT_ANTI_JOIN);
                 // because eqJoinConjuncts mustn't be empty in thrift
                 // we have to use markJoinConjuncts instead
                 for (Expr e : markJoinConjuncts) {
@@ -963,5 +958,13 @@ public class HashJoinNode extends JoinNodeBase {
         } else {
             return slotRef;
         }
+    }
+
+    @Override
+    public boolean isNullAwareLeftAntiJoin() {
+        if (joinOp == JoinOperator.NULL_AWARE_LEFT_ANTI_JOIN) {
+            return true;
+        }
+        return children.stream().anyMatch(PlanNode::isNullAwareLeftAntiJoin);
     }
 }

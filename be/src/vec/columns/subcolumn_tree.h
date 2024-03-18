@@ -48,14 +48,15 @@ public:
         const Node* parent = nullptr;
 
         Arena strings_pool;
-        HashMapWithStackMemory<StringRef, std::shared_ptr<Node>, StringRefHash, 4> children;
+        std::unordered_map<StringRef, std::shared_ptr<Node>, StringRefHash> children;
 
         NodeData data;
         PathInData path;
 
         bool is_nested() const { return kind == NESTED; }
         bool is_scalar() const { return kind == SCALAR; }
-        bool is_scalar_without_children() const { return kind == SCALAR && children.empty(); }
+
+        bool is_leaf_node() const { return kind == SCALAR && children.empty(); }
 
         // Only modify data and kind
         void modify(std::shared_ptr<Node>&& other) {
@@ -79,7 +80,7 @@ public:
         std::vector<StringRef> get_sorted_chilren_keys() const {
             std::vector<StringRef> sorted_keys;
             for (auto it = children.begin(); it != children.end(); ++it) {
-                sorted_keys.push_back(it->get_first());
+                sorted_keys.push_back(it->first);
             }
             std::sort(sorted_keys.begin(), sorted_keys.end());
             return sorted_keys;
@@ -87,7 +88,7 @@ public:
         std::shared_ptr<const Node> get_child_node(StringRef key) const {
             auto it = children.find(key);
             if (it != children.end()) {
-                return it->get_second();
+                return it->second;
             }
             return nullptr;
         }
@@ -153,7 +154,7 @@ public:
             auto it = current_node->children.find(
                     StringRef {parts[i].key.data(), parts[i].key.size()});
             if (it != current_node->children.end()) {
-                current_node = it->get_second().get();
+                current_node = it->second.get();
                 node_creator(current_node->kind, true);
 
                 if (current_node->is_nested() != parts[i].is_nested) {
@@ -172,8 +173,8 @@ public:
         if (it != current_node->children.end()) {
             // Modify this node to Node::SCALAR
             auto new_node = node_creator(Node::SCALAR, false);
-            it->get_second()->modify(std::move(new_node));
-            leaves.push_back(it->get_second());
+            it->second->modify(std::move(new_node));
+            leaves.push_back(it->second);
             return true;
         }
 
@@ -216,7 +217,7 @@ public:
         }
 
         for (auto it = node->children.begin(); it != node->children.end(); ++it) {
-            auto child = it->get_second();
+            auto child = it->second;
             if (const auto* leaf = find_leaf(child.get(), predicate)) {
                 return leaf;
             }
@@ -249,7 +250,7 @@ public:
             paths.push_back(node->path);
         }
         for (auto it = node->children.begin(); it != node->children.end(); ++it) {
-            auto child = it->get_second();
+            auto child = it->second;
             get_leaves_of_node(child.get(), nodes, paths);
         }
     }
@@ -278,7 +279,7 @@ private:
                 return find_exact ? nullptr : current_node;
             }
 
-            current_node = it->get_second().get();
+            current_node = it->second.get();
         }
 
         return current_node;

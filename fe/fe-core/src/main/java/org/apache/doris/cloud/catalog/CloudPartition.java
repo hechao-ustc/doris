@@ -42,6 +42,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 /**
@@ -58,6 +59,8 @@ public class CloudPartition extends Partition {
     private long dbId;
     @SerializedName(value = "tableId")
     private long tableId;
+
+    private ReentrantLock lock = new ReentrantLock(true);
 
     public CloudPartition(long id, String name, MaterializedIndex baseIndex,
                           DistributionInfo distributionInfo, long dbId, long tableId) {
@@ -88,17 +91,28 @@ public class CloudPartition extends Partition {
     }
 
     protected void setVisibleVersion(long visibleVersion) {
-        LOG.debug("setVisibleVersion use CloudPartition {}", super.getName());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("setVisibleVersion use CloudPartition {}", super.getName());
+        }
         return;
     }
 
-    protected void setCachedVisibleVersion(long version) {
-        super.setVisibleVersion(version);
+    public void setCachedVisibleVersion(long version) {
+        // we only care the version should increase monotonically and ignore the readers
+        LOG.debug("setCachedVisibleVersion use CloudPartition {}, version: {}, old version: {}",
+                super.getId(), version, super.getVisibleVersion());
+        lock.lock();
+        if (version > super.getVisibleVersion()) {
+            super.setVisibleVersion(version);
+        }
+        lock.unlock();
     }
 
     @Override
     public long getVisibleVersion() {
-        LOG.debug("getVisibleVersion use CloudPartition {}", super.getName());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("getVisibleVersion use CloudPartition {}", super.getName());
+        }
 
         Cloud.GetVersionRequest request = Cloud.GetVersionRequest.newBuilder()
                 .setDbId(this.dbId)
@@ -112,13 +126,15 @@ public class CloudPartition extends Partition {
             long version = -1;
             if (resp.getStatus().getCode() == MetaServiceCode.OK) {
                 version = resp.getVersion();
+                // Cache visible version, see hasData() for details.
+                setCachedVisibleVersion(version);
             } else {
                 assert resp.getStatus().getCode() == MetaServiceCode.VERSION_NOT_FOUND;
                 version = 0;
             }
-            LOG.debug("get version from meta service, version: {}, partition: {}", version, super.getId());
-            // Cache visible version, see hasData() for details.
-            super.setVisibleVersion(version);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("get version from meta service, version: {}, partition: {}", version, super.getId());
+            }
             if (version == 0 && isEmptyPartitionPruneDisabled()) {
                 version = 1;
             }
@@ -214,7 +230,9 @@ public class CloudPartition extends Partition {
                 .addAllPartitionIds(partitionIds)
                 .build();
 
-        LOG.debug("getVisibleVersion use CloudPartition {}", partitionIds.toString());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("getVisibleVersion use CloudPartition {}", partitionIds.toString());
+        }
         Cloud.GetVersionResponse resp = getVersionFromMeta(req);
         if (resp.getStatus().getCode() != MetaServiceCode.OK) {
             throw new RpcException("get visible version", "unexpected status " + resp.getStatus());
@@ -226,7 +244,9 @@ public class CloudPartition extends Partition {
                     "wrong number of versions, required " + partitionIds.size() + ", but got " + versions.size());
         }
 
-        LOG.debug("get version from meta service, partitions: {}, versions: {}", partitionIds, versions);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("get version from meta service, partitions: {}, versions: {}", partitionIds, versions);
+        }
 
         if (isEmptyPartitionPruneDisabled()) {
             ArrayList<Long> news = new ArrayList<>();
@@ -242,35 +262,39 @@ public class CloudPartition extends Partition {
     @Override
     public long getNextVersion() {
         // use meta service visibleVersion
-        LOG.debug("getNextVersion use CloudPartition {}", super.getName());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("getNextVersion use CloudPartition {}", super.getName());
+        }
         return -1;
     }
 
     @Override
     public void setNextVersion(long nextVersion) {
         // use meta service visibleVersion
-        LOG.debug("setNextVersion use CloudPartition {} Version {}", super.getName(), nextVersion);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("setNextVersion use CloudPartition {} Version {}", super.getName(), nextVersion);
+        }
         return;
     }
 
     @Override
     public void updateVersionForRestore(long visibleVersion) {
-        LOG.debug("updateVersionForRestore use CloudPartition {} version for restore: visible: {}",
-                super.getName(), visibleVersion);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("updateVersionForRestore use CloudPartition {} version for restore: visible: {}",
+                    super.getName(), visibleVersion);
+        }
         return;
     }
 
     @Override
     public void updateVisibleVersion(long visibleVersion) {
         // use meta service visibleVersion
-        LOG.debug("updateVisibleVersion use CloudPartition {} version for restore: visible: {}",
-                super.getName(), visibleVersion);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("updateVisibleVersion use CloudPartition {} version for restore: visible: {}",
+                    super.getName(), visibleVersion);
+        }
 
         return;
-    }
-
-    @Override
-    public void updateVisibleVersionAndTime(long visibleVersion, long visibleVersionTime) {
     }
 
     // Determine whether data this partition has, according to the cached visible version.
@@ -338,7 +362,9 @@ public class CloudPartition extends Partition {
 
                 if (resp.hasStatus() && (resp.getStatus().getCode() == MetaServiceCode.OK
                             || resp.getStatus().getCode() == MetaServiceCode.VERSION_NOT_FOUND)) {
-                    LOG.debug("get version from meta service, code: {}", resp.getStatus().getCode());
+                    if (LOG.isDebugEnabled()) {
+                        LOG.debug("get version from meta service, code: {}", resp.getStatus().getCode());
+                    }
                     return resp;
                 }
 

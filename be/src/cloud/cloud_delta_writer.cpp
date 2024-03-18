@@ -19,13 +19,15 @@
 
 #include "cloud/cloud_meta_mgr.h"
 #include "cloud/cloud_rowset_builder.h"
+#include "cloud/cloud_storage_engine.h"
 #include "olap/delta_writer.h"
+#include "runtime/thread_context.h"
 
 namespace doris {
 
 CloudDeltaWriter::CloudDeltaWriter(CloudStorageEngine& engine, const WriteRequest& req,
                                    RuntimeProfile* profile, const UniqueId& load_id)
-        : BaseDeltaWriter(req, profile, load_id) {
+        : BaseDeltaWriter(req, profile, load_id), _engine(engine) {
     _rowset_builder = std::make_unique<CloudRowsetBuilder>(engine, req, profile);
 }
 
@@ -44,6 +46,7 @@ Status CloudDeltaWriter::batch_init(std::vector<CloudDeltaWriter*> writers) {
         }
 
         tasks.emplace_back([writer] {
+            ThreadLocalHandle::create_thread_local_if_not_exits();
             std::lock_guard<bthread::Mutex> lock(writer->_mtx);
             if (writer->_is_init || writer->_is_cancelled) {
                 return Status::OK();
@@ -57,11 +60,11 @@ Status CloudDeltaWriter::batch_init(std::vector<CloudDeltaWriter*> writers) {
 
 Status CloudDeltaWriter::write(const vectorized::Block* block,
                                const std::vector<uint32_t>& row_idxs, bool is_append) {
-    if (UNLIKELY(row_idxs.empty() && !is_append)) {
+    if (row_idxs.empty() && !is_append) [[unlikely]] {
         return Status::OK();
     }
     std::lock_guard lock(_mtx);
-    CHECK(_is_init);
+    CHECK(_is_init || _is_cancelled);
     {
         SCOPED_TIMER(_wait_flush_limit_timer);
         while (_memtable_writer->flush_running_count() >=
@@ -99,6 +102,20 @@ void CloudDeltaWriter::update_tablet_stats() {
 
 const RowsetMetaSharedPtr& CloudDeltaWriter::rowset_meta() {
     return rowset_builder()->rowset_meta();
+}
+
+Status CloudDeltaWriter::commit_rowset() {
+    std::lock_guard<bthread::Mutex> lock(_mtx);
+    if (!_is_init) {
+        // No data to write, but still need to write a empty rowset kv to keep version continuous
+        RETURN_IF_ERROR(_rowset_builder->init());
+        RETURN_IF_ERROR(_rowset_builder->build_rowset());
+    }
+    return _engine.meta_mgr().commit_rowset(*rowset_meta());
+}
+
+Status CloudDeltaWriter::set_txn_related_delete_bitmap() {
+    return rowset_builder()->set_txn_related_delete_bitmap();
 }
 
 } // namespace doris

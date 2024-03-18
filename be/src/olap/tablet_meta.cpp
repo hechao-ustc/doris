@@ -29,6 +29,7 @@
 #include <set>
 #include <utility>
 
+#include "cloud/config.h"
 #include "common/config.h"
 #include "io/fs/file_writer.h"
 #include "io/fs/local_file_system.h"
@@ -72,7 +73,8 @@ TabletMetaSharedPtr TabletMeta::create(
             request.time_series_compaction_goal_size_mbytes,
             request.time_series_compaction_file_count_threshold,
             request.time_series_compaction_time_threshold_seconds,
-            request.time_series_compaction_empty_rowsets_threshold);
+            request.time_series_compaction_empty_rowsets_threshold,
+            request.time_series_compaction_level_threshold, request.inverted_index_storage_format);
 }
 
 TabletMeta::TabletMeta()
@@ -91,7 +93,9 @@ TabletMeta::TabletMeta(int64_t table_id, int64_t partition_id, int64_t tablet_id
                        int64_t time_series_compaction_goal_size_mbytes,
                        int64_t time_series_compaction_file_count_threshold,
                        int64_t time_series_compaction_time_threshold_seconds,
-                       int64_t time_series_compaction_empty_rowsets_threshold)
+                       int64_t time_series_compaction_empty_rowsets_threshold,
+                       int64_t time_series_compaction_level_threshold,
+                       TInvertedIndexStorageFormat::type inverted_index_storage_format)
         : _tablet_uid(0, 0),
           _schema(new TabletSchema),
           _delete_bitmap(new DeleteBitmap(tablet_id)) {
@@ -121,6 +125,8 @@ TabletMeta::TabletMeta(int64_t table_id, int64_t partition_id, int64_t tablet_id
             time_series_compaction_time_threshold_seconds);
     tablet_meta_pb.set_time_series_compaction_empty_rowsets_threshold(
             time_series_compaction_empty_rowsets_threshold);
+    tablet_meta_pb.set_time_series_compaction_level_threshold(
+            time_series_compaction_level_threshold);
     TabletSchemaPB* schema = tablet_meta_pb.mutable_schema();
     schema->set_num_short_key_columns(tablet_schema.short_key_column_count);
     schema->set_num_rows_per_row_block(config::default_num_rows_per_column_file_block);
@@ -164,6 +170,18 @@ TabletMeta::TabletMeta(int64_t table_id, int64_t partition_id, int64_t tablet_id
         break;
     default:
         schema->set_compression_type(segment_v2::LZ4F);
+        break;
+    }
+
+    switch (inverted_index_storage_format) {
+    case TInvertedIndexStorageFormat::V1:
+        schema->set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V1);
+        break;
+    case TInvertedIndexStorageFormat::V2:
+        schema->set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V2);
+        break;
+    default:
+        schema->set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V1);
         break;
     }
 
@@ -323,13 +341,15 @@ TabletMeta::TabletMeta(const TabletMeta& b)
           _time_series_compaction_time_threshold_seconds(
                   b._time_series_compaction_time_threshold_seconds),
           _time_series_compaction_empty_rowsets_threshold(
-                  b._time_series_compaction_empty_rowsets_threshold) {};
+                  b._time_series_compaction_empty_rowsets_threshold),
+          _time_series_compaction_level_threshold(b._time_series_compaction_level_threshold) {};
 
 void TabletMeta::init_column_from_tcolumn(uint32_t unique_id, const TColumn& tcolumn,
                                           ColumnPB* column) {
     column->set_unique_id(unique_id);
     column->set_name(tcolumn.column_name);
     column->set_has_bitmap_index(tcolumn.has_bitmap_index);
+    column->set_is_auto_increment(tcolumn.is_auto_increment);
     string data_type;
     EnumToString(TPrimitiveType, tcolumn.column_type.type, data_type);
     column->set_type(data_type);
@@ -452,7 +472,7 @@ Status TabletMeta::_save_meta(DataDir* data_dir) {
     string meta_binary;
 
     auto t1 = MonotonicMicros();
-    RETURN_IF_ERROR(serialize(&meta_binary));
+    serialize(&meta_binary);
     auto t2 = MonotonicMicros();
     Status status = TabletMetaManager::save(data_dir, tablet_id(), schema_hash(), meta_binary);
     if (!status.ok()) {
@@ -469,7 +489,7 @@ Status TabletMeta::_save_meta(DataDir* data_dir) {
     return status;
 }
 
-Status TabletMeta::serialize(string* meta_binary) {
+void TabletMeta::serialize(string* meta_binary) {
     TabletMetaPB tablet_meta_pb;
     to_meta_pb(&tablet_meta_pb);
     if (tablet_meta_pb.partition_id() <= 0) {
@@ -486,7 +506,6 @@ Status TabletMeta::serialize(string* meta_binary) {
     if (!serialize_success) {
         LOG(FATAL) << "failed to serialize meta " << tablet_id();
     }
-    return Status::OK();
 }
 
 Status TabletMeta::deserialize(const string& meta_binary) {
@@ -612,6 +631,8 @@ void TabletMeta::init_from_pb(const TabletMetaPB& tablet_meta_pb) {
             tablet_meta_pb.time_series_compaction_time_threshold_seconds();
     _time_series_compaction_empty_rowsets_threshold =
             tablet_meta_pb.time_series_compaction_empty_rowsets_threshold();
+    _time_series_compaction_level_threshold =
+            tablet_meta_pb.time_series_compaction_level_threshold();
 }
 
 void TabletMeta::to_meta_pb(TabletMetaPB* tablet_meta_pb) {
@@ -644,12 +665,16 @@ void TabletMeta::to_meta_pb(TabletMetaPB* tablet_meta_pb) {
         break;
     }
 
-    for (auto& rs : _rs_metas) {
-        rs->to_rowset_pb(tablet_meta_pb->add_rs_metas());
+    // RowsetMetaPB is separated from TabletMetaPB
+    if (!config::is_cloud_mode()) {
+        for (auto& rs : _rs_metas) {
+            rs->to_rowset_pb(tablet_meta_pb->add_rs_metas());
+        }
+        for (auto rs : _stale_rs_metas) {
+            rs->to_rowset_pb(tablet_meta_pb->add_stale_rs_metas());
+        }
     }
-    for (auto rs : _stale_rs_metas) {
-        rs->to_rowset_pb(tablet_meta_pb->add_stale_rs_metas());
-    }
+
     _schema->to_schema_pb(tablet_meta_pb->mutable_schema());
 
     tablet_meta_pb->set_in_restore_mode(in_restore_mode());
@@ -696,6 +721,8 @@ void TabletMeta::to_meta_pb(TabletMetaPB* tablet_meta_pb) {
             time_series_compaction_time_threshold_seconds());
     tablet_meta_pb->set_time_series_compaction_empty_rowsets_threshold(
             time_series_compaction_empty_rowsets_threshold());
+    tablet_meta_pb->set_time_series_compaction_level_threshold(
+            time_series_compaction_level_threshold());
 }
 
 int64_t TabletMeta::mem_size() const {
@@ -890,6 +917,8 @@ bool operator==(const TabletMeta& a, const TabletMeta& b) {
         return false;
     if (a._time_series_compaction_empty_rowsets_threshold !=
         b._time_series_compaction_empty_rowsets_threshold)
+        return false;
+    if (a._time_series_compaction_level_threshold != b._time_series_compaction_level_threshold)
         return false;
     return true;
 }
@@ -1092,11 +1121,8 @@ std::shared_ptr<roaring::Roaring> DeleteBitmap::get_agg(const BitmapKey& bmk) co
                 val->bitmap |= bm;
             }
         }
-        static auto deleter = [](const CacheKey& key, void* value) {
-            delete (AggCache::Value*)value; // Just delete to reclaim
-        };
         size_t charge = val->bitmap.getSizeInBytes() + sizeof(AggCache::Value);
-        handle = _agg_cache->repr()->insert(key, val, charge, deleter, CachePriority::NORMAL);
+        handle = _agg_cache->repr()->insert(key, val, charge, charge, CachePriority::NORMAL);
     }
 
     // It is natural for the cache to reclaim the underlying memory

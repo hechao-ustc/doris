@@ -306,6 +306,8 @@ void VNodeChannel::clear_all_blocks() {
     _cur_mutable_block.reset();
 }
 
+// we don't need to send tablet_writer_cancel rpc request when
+// init failed, so set _is_closed to true.
 // if "_cancelled" is set to true,
 // no need to set _cancel_msg because the error will be
 // returned directly via "TabletSink::prepare()" method.
@@ -322,6 +324,7 @@ Status VNodeChannel::init(RuntimeState* state) {
     const auto* node = _parent->_nodes_info->find_node(_node_id);
     if (node == nullptr) {
         _cancelled = true;
+        _is_closed = true;
         return Status::InternalError("unknown node id, id={}", _node_id);
     }
     _node_info = *node;
@@ -336,6 +339,7 @@ Status VNodeChannel::init(RuntimeState* state) {
                                                                         _node_info.brpc_port);
     if (_stub == nullptr) {
         _cancelled = true;
+        _is_closed = true;
         return Status::InternalError("Get rpc stub failed, host={}, port={}, info={}",
                                      _node_info.host, _node_info.brpc_port, channel_info());
     }
@@ -353,9 +357,10 @@ Status VNodeChannel::init(RuntimeState* state) {
     _cur_add_block_request->set_eos(false);
 
     // add block closure
+    // Has to using value to capture _task_exec_ctx because tablet writer may destroyed during callback.
     _send_block_callback = WriteBlockCallback<PTabletWriterAddBlockResult>::create_shared();
-    _send_block_callback->addFailedHandler([this](bool is_last_rpc) {
-        auto ctx_lock = _task_exec_ctx.lock();
+    _send_block_callback->addFailedHandler([&, task_exec_ctx = _task_exec_ctx](bool is_last_rpc) {
+        auto ctx_lock = task_exec_ctx.lock();
         if (ctx_lock == nullptr) {
             return;
         }
@@ -363,8 +368,9 @@ Status VNodeChannel::init(RuntimeState* state) {
     });
 
     _send_block_callback->addSuccessHandler(
-            [this](const PTabletWriterAddBlockResult& result, bool is_last_rpc) {
-                auto ctx_lock = _task_exec_ctx.lock();
+            [&, task_exec_ctx = _task_exec_ctx](const PTabletWriterAddBlockResult& result,
+                                                bool is_last_rpc) {
+                auto ctx_lock = task_exec_ctx.lock();
                 if (ctx_lock == nullptr) {
                     return;
                 }
@@ -393,7 +399,9 @@ void VNodeChannel::_open_internal(bool is_incremental) {
     request->set_index_id(_index_channel->_index_id);
     request->set_txn_id(_parent->_txn_id);
     request->set_allocated_schema(_parent->_schema->to_protobuf());
-
+    if (_parent->_t_sink.olap_table_sink.__isset.storage_vault_id) {
+        request->set_storage_vault_id(_parent->_t_sink.olap_table_sink.storage_vault_id);
+    }
     std::set<int64_t> deduper;
     for (auto& tablet : _tablets_wait_open) {
         if (deduper.contains(tablet.tablet_id)) {
@@ -418,6 +426,7 @@ void VNodeChannel::_open_internal(bool is_incremental) {
     request->set_enable_profile(_state->enable_profile());
     request->set_is_incremental(is_incremental);
     request->set_txn_expiration(_parent->_txn_expiration);
+    request->set_write_file_cache(_parent->_write_file_cache);
 
     auto open_callback = DummyBrpcCallback<PTabletWriterOpenResult>::create_shared();
     auto open_closure = AutoReleaseClosure<
@@ -442,6 +451,7 @@ void VNodeChannel::open() {
 }
 
 void VNodeChannel::incremental_open() {
+    VLOG_DEBUG << "incremental opening node channel" << _node_id;
     _open_internal(true);
 }
 
@@ -840,8 +850,10 @@ void VNodeChannel::_add_block_failed_callback(bool is_last_rpc) {
     }
 }
 
+// When _cancelled is true, we still need to send a tablet_writer_cancel
+// rpc request to truly release the load channel
 void VNodeChannel::cancel(const std::string& cancel_msg) {
-    if (_is_closed || _cancelled) {
+    if (_is_closed) {
         // skip the channels that have been canceled or close_wait.
         return;
     }
@@ -909,7 +921,7 @@ Status VNodeChannel::close_wait(RuntimeState* state) {
     _close_time_ms = UnixMillis() - _close_time_ms;
 
     if (_cancelled || state->is_cancelled()) {
-        _cancel_with_msg(state->cancel_reason());
+        cancel(state->cancel_reason());
     }
 
     if (_add_batches_finished) {
@@ -1122,6 +1134,7 @@ Status VTabletWriter::_init(RuntimeState* state, RuntimeProfile* profile) {
     _txn_id = table_sink.txn_id;
     _num_replicas = table_sink.num_replicas;
     _tuple_desc_id = table_sink.tuple_id;
+    _write_file_cache = table_sink.write_file_cache;
     _schema.reset(new OlapTableSchemaParam());
     RETURN_IF_ERROR(_schema->init(table_sink.schema));
     _location = _pool->add(new OlapTableLocationParam(table_sink.location));

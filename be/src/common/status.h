@@ -273,6 +273,7 @@ namespace ErrorCode {
     E(INVERTED_INDEX_BUILD_WAITTING, -6008, false);          \
     E(INVERTED_INDEX_NOT_IMPLEMENTED, -6009, false);         \
     E(INVERTED_INDEX_COMPACTION_ERROR, -6010, false);        \
+    E(INVERTED_INDEX_ANALYZER_ERROR, -6011, false);          \
     E(KEY_NOT_FOUND, -7000, false);                          \
     E(KEY_ALREADY_EXISTS, -7001, false);                     \
     E(ENTRY_NOT_FOUND, -7002, false);                        \
@@ -494,7 +495,7 @@ public:
 
     friend std::ostream& operator<<(std::ostream& ostr, const Status& status);
 
-    std::string msg() const { return _err_msg ? _err_msg->_msg : ""; }
+    std::string_view msg() const { return _err_msg ? _err_msg->_msg : std::string_view(""); }
 
 private:
     int _code;
@@ -571,6 +572,14 @@ inline std::string Status::to_string_no_stack() const {
             LOG(ERROR) << _status_;     \
             exit(1);                    \
         }                               \
+    } while (false)
+
+#define RETURN_FALSE_IF_ERROR(stmt)   \
+    do {                              \
+        Status status = (stmt);       \
+        if (UNLIKELY(!status.ok())) { \
+            return false;             \
+        }                             \
     } while (false)
 
 /// @brief Emit a warning if @c to_call returns a bad status.

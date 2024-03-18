@@ -29,6 +29,11 @@ targetJdbcUrl = "jdbc:mysql://127.0.0.1:9030/?useLocalSessionState=true&allowLoa
 jdbcUser = "root"
 jdbcPassword = ""
 
+ccrDownstreamUrl = "jdbc:mysql://127.0.0.1:9030/?useLocalSessionState=true&allowLoadLocalInfile=true"
+ccrDownstreamUser = "root"
+ccrDownstreamPassword = ""
+ccrDownstreamFeThriftAddress = "127.0.0.1:9020"
+
 feSourceThriftAddress = "127.0.0.1:9020"
 feTargetThriftAddress = "127.0.0.1:9020"
 syncerAddress = "127.0.0.1:9190"
@@ -113,6 +118,7 @@ sqlserver_2022_port=1433
 clickhouse_22_port=8123
 doris_port=9030
 mariadb_10_port=3326
+db2_11_port=50000
 
 // hive catalog test config
 // To enable hive/paimon test, you need first start hive container.

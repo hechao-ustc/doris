@@ -138,11 +138,10 @@ DataDir::DataDir(StorageEngine& engine, const std::string& path, int64_t capacit
 
 DataDir::~DataDir() {
     DorisMetrics::instance()->metric_registry()->deregister_entity(_data_dir_metric_entity);
-    delete _id_generator;
     delete _meta;
 }
 
-Status DataDir::init() {
+Status DataDir::init(bool init_meta) {
     bool exists = false;
     RETURN_IF_ERROR(io::global_local_filesystem()->exists(_path, &exists));
     if (!exists) {
@@ -154,7 +153,9 @@ Status DataDir::init() {
     RETURN_NOT_OK_STATUS_WITH_WARN(_init_cluster_id(), "_init_cluster_id failed");
     RETURN_NOT_OK_STATUS_WITH_WARN(_init_capacity_and_create_shards(),
                                    "_init_capacity_and_create_shards failed");
-    RETURN_NOT_OK_STATUS_WITH_WARN(_init_meta(), "_init_meta failed");
+    if (init_meta) {
+        RETURN_NOT_OK_STATUS_WITH_WARN(_init_meta(), "_init_meta failed");
+    }
 
     _is_used = true;
     return Status::OK();
@@ -493,8 +494,8 @@ Status DataDir::load() {
     }
     if (rowset_partition_id_eq_0_num > config::ignore_invalid_partition_id_rowset_num) {
         LOG(FATAL) << fmt::format(
-                "roswet partition id eq 0 bigger than config {}, be exit, plz check be.INFO",
-                config::ignore_invalid_partition_id_rowset_num);
+                "roswet partition id eq 0 is {} bigger than config {}, be exit, plz check be.INFO",
+                rowset_partition_id_eq_0_num, config::ignore_invalid_partition_id_rowset_num);
         exit(-1);
     }
 
@@ -713,7 +714,7 @@ void DataDir::_perform_path_gc_by_rowset(const std::vector<std::string>& tablet_
         bool is_valid = doris::TabletManager::get_tablet_id_and_schema_hash_from_path(
                 path, &tablet_id, &schema_hash);
         if (!is_valid || tablet_id < 1 || schema_hash < 1) [[unlikely]] {
-            LOG(WARNING) << "unknown path:" << path;
+            LOG(WARNING) << "[path gc] unknown path:" << path;
             continue;
         }
 
@@ -734,7 +735,7 @@ void DataDir::_perform_path_gc_by_rowset(const std::vector<std::string>& tablet_
         std::vector<io::FileInfo> files;
         auto st = io::global_local_filesystem()->list(path, true, &files, &exists);
         if (!st.ok()) [[unlikely]] {
-            LOG(WARNING) << "fail to list tablet path " << path << " : " << st;
+            LOG(WARNING) << "[path gc] fail to list tablet path " << path << " : " << st;
             continue;
         }
 
@@ -763,10 +764,10 @@ void DataDir::_perform_path_gc_by_rowset(const std::vector<std::string>& tablet_
         auto reclaim_rowset_file = [](const std::string& path) {
             auto st = io::global_local_filesystem()->delete_file(path);
             if (!st.ok()) [[unlikely]] {
-                LOG(WARNING) << "failed to delete garbage rowset file: " << st;
+                LOG(WARNING) << "[path gc] failed to delete garbage rowset file: " << st;
                 return;
             }
-            LOG(INFO) << "delete garbage path: " << path; // Audit log
+            LOG(INFO) << "[path gc] delete garbage path: " << path; // Audit log
         };
 
         auto should_reclaim = [&, this](const RowsetId& rowset_id) {
@@ -777,7 +778,7 @@ void DataDir::_perform_path_gc_by_rowset(const std::vector<std::string>& tablet_
         };
 
         // rowset_id -> is_garbage
-        std::unordered_map<RowsetId, bool, HashOfRowsetId> checked_rowsets;
+        std::unordered_map<RowsetId, bool> checked_rowsets;
         for (auto&& [rowset_id, filename] : rowsets_not_pending) {
             if (auto it = checked_rowsets.find(rowset_id); it != checked_rowsets.end()) {
                 if (it->second) { // Is checked garbage rowset

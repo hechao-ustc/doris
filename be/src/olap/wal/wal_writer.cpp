@@ -48,14 +48,20 @@ Status WalWriter::init() {
 }
 
 Status WalWriter::finalize() {
+    if (!_file_writer) {
+        return Status::InternalError("wal writer is null,fail to close file={}", _file_name);
+    }
     auto st = _file_writer->close();
     if (!st.ok()) {
-        LOG(WARNING) << "fail to close file " << _file_name;
+        LOG(WARNING) << "fail to close wal " << _file_name;
     }
     return Status::OK();
 }
 
 Status WalWriter::append_blocks(const PBlockArray& blocks) {
+    if (!_file_writer) {
+        return Status::InternalError("wal writer is null,fail to write file={}", _file_name);
+    }
     size_t total_size = 0;
     size_t offset = 0;
     for (const auto& block : blocks) {
@@ -85,6 +91,9 @@ Status WalWriter::append_blocks(const PBlockArray& blocks) {
 }
 
 Status WalWriter::append_header(uint32_t version, std::string col_ids) {
+    if (!_file_writer) {
+        return Status::InternalError("wal writer is null,fail to write file={}", _file_name);
+    }
     size_t total_size = 0;
     uint64_t length = col_ids.size();
     total_size += k_wal_magic_length;

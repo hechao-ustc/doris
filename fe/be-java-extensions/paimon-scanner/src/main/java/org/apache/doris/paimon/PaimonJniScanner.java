@@ -19,7 +19,6 @@ package org.apache.doris.paimon;
 
 import org.apache.doris.common.jni.JniScanner;
 import org.apache.doris.common.jni.vec.ColumnType;
-import org.apache.doris.common.jni.vec.ScanPredicate;
 import org.apache.doris.common.jni.vec.TableSchema;
 import org.apache.doris.paimon.PaimonTableCache.PaimonTableCacheKey;
 import org.apache.doris.paimon.PaimonTableCache.TableExt;
@@ -64,7 +63,9 @@ public class PaimonJniScanner extends JniScanner {
 
     public PaimonJniScanner(int batchSize, Map<String, String> params) {
         this.classLoader = this.getClass().getClassLoader();
-        LOG.debug("params:{}", params);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("params:{}", params);
+        }
         this.params = params;
         String[] requiredFields = params.get("required_fields").split(",");
         String[] requiredTypes = params.get("columns_types").split("#");
@@ -80,7 +81,7 @@ public class PaimonJniScanner extends JniScanner {
         dbId = Long.parseLong(params.get("db_id"));
         tblId = Long.parseLong(params.get("tbl_id"));
         lastUpdateTime = Long.parseLong(params.get("last_update_time"));
-        initTableInfo(columnTypes, requiredFields, new ScanPredicate[0], batchSize);
+        initTableInfo(columnTypes, requiredFields, batchSize);
         paimonOptionParams = params.entrySet().stream()
                 .filter(kv -> kv.getKey().startsWith(PAIMON_OPTION_PREFIX))
                 .collect(Collectors
@@ -117,13 +118,17 @@ public class PaimonJniScanner extends JniScanner {
 
     private List<Predicate> getPredicates() {
         List<Predicate> predicates = PaimonScannerUtils.decodeStringToObject(paimonPredicate);
-        LOG.debug("predicates:{}", predicates);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("predicates:{}", predicates);
+        }
         return predicates;
     }
 
     private Split getSplit() {
         Split split = PaimonScannerUtils.decodeStringToObject(paimonSplit);
-        LOG.debug("split:{}", split);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("split:{}", split);
+        }
         return split;
     }
 
@@ -201,7 +206,9 @@ public class PaimonJniScanner extends JniScanner {
         }
         this.table = tableExt.getTable();
         paimonAllFieldNames = PaimonScannerUtils.fieldNames(this.table.rowType());
-        LOG.debug("paimonAllFieldNames:{}", paimonAllFieldNames);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("paimonAllFieldNames:{}", paimonAllFieldNames);
+        }
     }
 
 }

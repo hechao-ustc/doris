@@ -47,12 +47,14 @@
 #include "gutil/strings/split.h"
 #include "gutil/strings/substitute.h"
 #include "http/http_client.h"
+#include "io/fs/local_file_system.h"
 #include "olap/olap_common.h"
 #include "olap/olap_define.h"
 #include "olap/rowset/beta_rowset.h"
 #include "olap/rowset/pending_rowset_helper.h"
 #include "olap/rowset/rowset_factory.h"
 #include "olap/rowset/rowset_meta.h"
+#include "olap/snapshot_manager.h"
 #include "olap/storage_engine.h"
 #include "olap/tablet_manager.h"
 #include "olap/tablet_meta.h"
@@ -104,12 +106,22 @@ void _ingest_binlog(StorageEngine& engine, IngestBinlogArg* arg) {
     auto& request = arg->request;
 
     TStatus tstatus;
+    std::vector<std::string> download_success_files;
     Defer defer {[=, &engine, &tstatus, ingest_binlog_tstatus = arg->tstatus]() {
         LOG(INFO) << "ingest binlog. result: " << apache::thrift::ThriftDebugString(tstatus);
         if (tstatus.status_code != TStatusCode::OK) {
             // abort txn
             engine.txn_manager()->abort_txn(partition_id, txn_id, local_tablet_id,
                                             local_tablet_uid);
+            // delete all successfully downloaded files
+            LOG(WARNING) << "will delete downloaded success files due to error " << tstatus;
+            std::vector<io::Path> paths;
+            for (const auto& file : download_success_files) {
+                paths.emplace_back(file);
+                LOG(WARNING) << "will delete downloaded success file " << file << " due to error";
+            }
+            static_cast<void>(io::global_local_filesystem()->batch_delete(paths));
+            LOG(WARNING) << "done delete downloaded success files due to error " << tstatus;
         }
 
         if (ingest_binlog_tstatus) {
@@ -225,7 +237,8 @@ void _ingest_binlog(StorageEngine& engine, IngestBinlogArg* arg) {
     }
 
     // Step 5.2: check data capacity
-    uint64_t total_size = std::accumulate(segment_file_sizes.begin(), segment_file_sizes.end(), 0);
+    uint64_t total_size = std::accumulate(segment_file_sizes.begin(), segment_file_sizes.end(),
+                                          0ULL); // NOLINT(bugprone-fold-init-type)
     if (!local_tablet->can_add_binlog(total_size)) {
         LOG(WARNING) << "failed to add binlog, no enough space, total_size=" << total_size
                      << ", tablet=" << local_tablet->tablet_id();
@@ -250,10 +263,11 @@ void _ingest_binlog(StorageEngine& engine, IngestBinlogArg* arg) {
         LOG(INFO) << fmt::format("download segment file from {} to {}", get_segment_file_url,
                                  local_segment_path);
         auto get_segment_file_cb = [&get_segment_file_url, &local_segment_path, segment_file_size,
-                                    estimate_timeout](HttpClient* client) {
+                                    estimate_timeout, &download_success_files](HttpClient* client) {
             RETURN_IF_ERROR(client->init(get_segment_file_url));
             client->set_timeout_ms(estimate_timeout * 1000);
             RETURN_IF_ERROR(client->download(local_segment_path));
+            download_success_files.push_back(local_segment_path);
 
             std::error_code ec;
             // Check file length
@@ -270,8 +284,8 @@ void _ingest_binlog(StorageEngine& engine, IngestBinlogArg* arg) {
                              << ", local_file_size=" << local_file_size;
                 return Status::InternalError("downloaded file size is not equal");
             }
-            chmod(local_segment_path.c_str(), S_IRUSR | S_IWUSR);
-            return Status::OK();
+            return io::global_local_filesystem()->permission(local_segment_path,
+                                                             io::LocalFileSystem::PERMS_OWNER_RW);
         };
 
         auto status = HttpClient::execute_with_retry(max_retry, 1, get_segment_file_cb);
@@ -283,8 +297,117 @@ void _ingest_binlog(StorageEngine& engine, IngestBinlogArg* arg) {
         }
     }
 
-    // Step 6: create rowset && calculate delete bitmap && commit
-    // Step 6.1: create rowset
+    // Step 6: get all segment index files
+    // Step 6.1: get all segment index files size
+    std::vector<std::string> segment_index_file_urls;
+    std::vector<uint64_t> segment_index_file_sizes;
+    std::vector<std::string> segment_index_file_names;
+    auto tablet_schema = rowset_meta->tablet_schema();
+    for (const auto& index : tablet_schema->indexes()) {
+        if (index.index_type() != IndexType::INVERTED) {
+            continue;
+        }
+        auto index_id = index.index_id();
+        for (int64_t segment_index = 0; segment_index < num_segments; ++segment_index) {
+            auto get_segment_index_file_size_url = fmt::format(
+                    "{}?method={}&tablet_id={}&rowset_id={}&segment_index={}&segment_index_id={"
+                    "}",
+                    binlog_api_url, "get_segment_index_file", request.remote_tablet_id,
+                    remote_rowset_id, segment_index, index_id);
+            uint64_t segment_index_file_size;
+            auto get_segment_index_file_size_cb = [&get_segment_index_file_size_url,
+                                                   &segment_index_file_size](HttpClient* client) {
+                RETURN_IF_ERROR(client->init(get_segment_index_file_size_url));
+                client->set_timeout_ms(kMaxTimeoutMs);
+                RETURN_IF_ERROR(client->head());
+                return client->get_content_length(&segment_index_file_size);
+            };
+            auto index_file = InvertedIndexDescriptor::inverted_index_file_path(
+                    local_tablet->tablet_path(), rowset_meta->rowset_id(), segment_index, index_id,
+                    index.get_index_suffix());
+            segment_index_file_names.push_back(index_file);
+
+            status = HttpClient::execute_with_retry(max_retry, 1, get_segment_index_file_size_cb);
+            if (!status.ok()) {
+                LOG(WARNING) << "failed to get segment file size from "
+                             << get_segment_index_file_size_url
+                             << ", status=" << status.to_string();
+                status.to_thrift(&tstatus);
+                return;
+            }
+
+            segment_index_file_sizes.push_back(segment_index_file_size);
+            segment_index_file_urls.push_back(std::move(get_segment_index_file_size_url));
+        }
+    }
+
+    // Step 6.2: check data capacity
+    uint64_t total_index_size =
+            std::accumulate(segment_index_file_sizes.begin(), segment_index_file_sizes.end(),
+                            0ULL); // NOLINT(bugprone-fold-init-type)
+    if (!local_tablet->can_add_binlog(total_index_size)) {
+        LOG(WARNING) << "failed to add binlog, no enough space, total_index_size="
+                     << total_index_size << ", tablet=" << local_tablet->tablet_id();
+        status = Status::InternalError("no enough space");
+        status.to_thrift(&tstatus);
+        return;
+    }
+
+    // Step 6.3: get all segment index files
+    DCHECK(segment_index_file_sizes.size() == segment_index_file_names.size());
+    DCHECK(segment_index_file_names.size() == segment_index_file_urls.size());
+    for (int64_t i = 0; i < segment_index_file_urls.size(); ++i) {
+        auto segment_index_file_size = segment_index_file_sizes[i];
+        auto get_segment_index_file_url = segment_index_file_urls[i];
+
+        uint64_t estimate_timeout =
+                segment_index_file_size / config::download_low_speed_limit_kbps / 1024;
+        if (estimate_timeout < config::download_low_speed_time) {
+            estimate_timeout = config::download_low_speed_time;
+        }
+
+        auto local_segment_index_path = segment_index_file_names[i];
+        LOG(INFO) << fmt::format("download segment index file from {} to {}",
+                                 get_segment_index_file_url, local_segment_index_path);
+        auto get_segment_index_file_cb = [&get_segment_index_file_url, &local_segment_index_path,
+                                          segment_index_file_size, estimate_timeout,
+                                          &download_success_files](HttpClient* client) {
+            RETURN_IF_ERROR(client->init(get_segment_index_file_url));
+            client->set_timeout_ms(estimate_timeout * 1000);
+            RETURN_IF_ERROR(client->download(local_segment_index_path));
+            download_success_files.push_back(local_segment_index_path);
+
+            std::error_code ec;
+            // Check file length
+            uint64_t local_index_file_size =
+                    std::filesystem::file_size(local_segment_index_path, ec);
+            if (ec) {
+                LOG(WARNING) << "download index file error" << ec.message();
+                return Status::IOError("can't retrive file_size of {}, due to {}",
+                                       local_segment_index_path, ec.message());
+            }
+            if (local_index_file_size != segment_index_file_size) {
+                LOG(WARNING) << "download index file length error"
+                             << ", get_segment_index_file_url=" << get_segment_index_file_url
+                             << ", index_file_size=" << segment_index_file_size
+                             << ", local_index_file_size=" << local_index_file_size;
+                return Status::InternalError("downloaded index file size is not equal");
+            }
+            return io::global_local_filesystem()->permission(local_segment_index_path,
+                                                             io::LocalFileSystem::PERMS_OWNER_RW);
+        };
+
+        status = HttpClient::execute_with_retry(max_retry, 1, get_segment_index_file_cb);
+        if (!status.ok()) {
+            LOG(WARNING) << "failed to get segment index file from " << get_segment_index_file_url
+                         << ", status=" << status.to_string();
+            status.to_thrift(&tstatus);
+            return;
+        }
+    }
+
+    // Step 7: create rowset && calculate delete bitmap && commit
+    // Step 7.1: create rowset
     RowsetSharedPtr rowset;
     status = RowsetFactory::create_rowset(local_tablet->tablet_schema(),
                                           local_tablet->tablet_path(), rowset_meta, &rowset);
@@ -299,7 +422,7 @@ void _ingest_binlog(StorageEngine& engine, IngestBinlogArg* arg) {
         return;
     }
 
-    // Step 6.2 calculate delete bitmap before commit
+    // Step 7.2 calculate delete bitmap before commit
     auto calc_delete_bitmap_token = engine.calc_delete_bitmap_executor()->create_token();
     DeleteBitmapPtr delete_bitmap = std::make_shared<DeleteBitmap>(local_tablet_id);
     RowsetIdUnorderedSet pre_rowset_ids;
@@ -334,7 +457,7 @@ void _ingest_binlog(StorageEngine& engine, IngestBinlogArg* arg) {
         static_cast<void>(calc_delete_bitmap_token->wait());
     }
 
-    // Step 6.3: commit txn
+    // Step 7.3: commit txn
     Status commit_txn_status = engine.txn_manager()->commit_txn(
             local_tablet->data_dir()->get_meta(), rowset_meta->partition_id(),
             rowset_meta->txn_id(), rowset_meta->tablet_id(), local_tablet->tablet_uid(),
@@ -360,26 +483,20 @@ void _ingest_binlog(StorageEngine& engine, IngestBinlogArg* arg) {
 }
 } // namespace
 
-using apache::thrift::TException;
-using apache::thrift::TProcessor;
-using apache::thrift::TMultiplexedProcessor;
-using apache::thrift::transport::TTransportException;
-using apache::thrift::concurrency::ThreadFactory;
-
 BaseBackendService::BaseBackendService(ExecEnv* exec_env)
         : _exec_env(exec_env), _agent_server(new AgentServer(exec_env, *exec_env->master_info())) {}
+
+BaseBackendService::~BaseBackendService() = default;
 
 BackendService::BackendService(StorageEngine& engine, ExecEnv* exec_env)
         : BaseBackendService(exec_env), _engine(engine) {}
 
-Status BaseBackendService::create_service(ExecEnv* exec_env, int port,
-                                          std::unique_ptr<ThriftServer>* server) {
-    if (config::is_cloud_mode()) {
-        // TODO(plat1ko): cloud mode
-        return Status::NotSupported("Currently only support local storage engine");
-    }
-    auto service =
-            std::make_shared<BackendService>(exec_env->storage_engine().to_local(), exec_env);
+BackendService::~BackendService() = default;
+
+Status BackendService::create_service(StorageEngine& engine, ExecEnv* exec_env, int port,
+                                      std::unique_ptr<ThriftServer>* server) {
+    auto service = std::make_shared<BackendService>(engine, exec_env);
+    service->_agent_server->start_workers(engine, exec_env);
     // TODO: do we want a BoostThreadFactory?
     // TODO: we want separate thread factories here, so that fe requests can't starve
     // be requests
@@ -695,12 +812,37 @@ void BackendService::check_storage_format(TCheckStorageFormatResult& result) {
 
 void BackendService::make_snapshot(TAgentResult& return_value,
                                    const TSnapshotRequest& snapshot_request) {
-    _agent_server->make_snapshot(_engine, return_value, snapshot_request);
+    std::string snapshot_path;
+    bool allow_incremental_clone = false;
+    Status status = _engine.snapshot_mgr()->make_snapshot(snapshot_request, &snapshot_path,
+                                                          &allow_incremental_clone);
+    if (!status) {
+        LOG_WARNING("failed to make snapshot")
+                .tag("tablet_id", snapshot_request.tablet_id)
+                .tag("schema_hash", snapshot_request.schema_hash)
+                .error(status);
+    } else {
+        LOG_INFO("successfully make snapshot")
+                .tag("tablet_id", snapshot_request.tablet_id)
+                .tag("schema_hash", snapshot_request.schema_hash)
+                .tag("snapshot_path", snapshot_path);
+        return_value.__set_snapshot_path(snapshot_path);
+        return_value.__set_allow_incremental_clone(allow_incremental_clone);
+    }
+
+    status.to_thrift(&return_value.status);
+    return_value.__set_snapshot_version(snapshot_request.preferred_snapshot_version);
 }
 
 void BackendService::release_snapshot(TAgentResult& return_value,
                                       const std::string& snapshot_path) {
-    _agent_server->release_snapshot(_engine, return_value, snapshot_path);
+    Status status = _engine.snapshot_mgr()->release_snapshot(snapshot_path);
+    if (!status) {
+        LOG_WARNING("failed to release snapshot").tag("snapshot_path", snapshot_path).error(status);
+    } else {
+        LOG_INFO("successfully release snapshot").tag("snapshot_path", snapshot_path);
+    }
+    status.to_thrift(&return_value.status);
 }
 
 void BackendService::ingest_binlog(TIngestBinlogResult& result,
@@ -903,29 +1045,84 @@ void BackendService::query_ingest_binlog(TQueryIngestBinlogResult& result,
     }
 }
 
+void BaseBackendService::get_tablet_stat(TTabletStatResult& result) {
+    LOG(ERROR) << "get_tablet_stat is not implemented";
+}
+
+int64_t BaseBackendService::get_trash_used_capacity() {
+    LOG(ERROR) << "get_trash_used_capacity is not implemented";
+    return 0;
+}
+
+void BaseBackendService::get_stream_load_record(TStreamLoadRecordResult& result,
+                                                int64_t last_stream_record_time) {
+    LOG(ERROR) << "get_stream_load_record is not implemented";
+}
+
+void BaseBackendService::get_disk_trash_used_capacity(std::vector<TDiskTrashInfo>& diskTrashInfos) {
+    LOG(ERROR) << "get_disk_trash_used_capacity is not implemented";
+}
+
+void BaseBackendService::clean_trash() {
+    LOG(ERROR) << "clean_trash is not implemented";
+}
+
+void BaseBackendService::make_snapshot(TAgentResult& return_value,
+                                       const TSnapshotRequest& snapshot_request) {
+    LOG(ERROR) << "make_snapshot is not implemented";
+    return_value.__set_status(Status::NotSupported("make_snapshot is not implemented").to_thrift());
+}
+
+void BaseBackendService::release_snapshot(TAgentResult& return_value,
+                                          const std::string& snapshot_path) {
+    LOG(ERROR) << "release_snapshot is not implemented";
+    return_value.__set_status(
+            Status::NotSupported("release_snapshot is not implemented").to_thrift());
+}
+
+void BaseBackendService::check_storage_format(TCheckStorageFormatResult& result) {
+    LOG(ERROR) << "check_storage_format is not implemented";
+}
+
+void BaseBackendService::ingest_binlog(TIngestBinlogResult& result,
+                                       const TIngestBinlogRequest& request) {
+    LOG(ERROR) << "ingest_binlog is not implemented";
+    result.__set_status(Status::NotSupported("ingest_binlog is not implemented").to_thrift());
+}
+
+void BaseBackendService::query_ingest_binlog(TQueryIngestBinlogResult& result,
+                                             const TQueryIngestBinlogRequest& request) {
+    LOG(ERROR) << "query_ingest_binlog is not implemented";
+    result.__set_status(TIngestBinlogStatus::UNKNOWN);
+    result.__set_err_msg("query_ingest_binlog is not implemented");
+}
+
 void BaseBackendService::pre_cache_async(TPreCacheAsyncResponse& response,
                                          const TPreCacheAsyncRequest& request) {
-    LOG(FATAL) << "BackendService is not implemented";
+    LOG(ERROR) << "pre_cache_async is not implemented";
+    response.__set_status(Status::NotSupported("pre_cache_async is not implemented").to_thrift());
 }
 
 void BaseBackendService::check_pre_cache(TCheckPreCacheResponse& response,
                                          const TCheckPreCacheRequest& request) {
-    LOG(FATAL) << "BackendService is not implemented";
+    LOG(ERROR) << "check_pre_cache is not implemented";
+    response.__set_status(Status::NotSupported("check_pre_cache is not implemented").to_thrift());
 }
 
 void BaseBackendService::sync_load_for_tablets(TSyncLoadForTabletsResponse& response,
                                                const TSyncLoadForTabletsRequest& request) {
-    LOG(FATAL) << "BackendService is not implemented";
+    LOG(ERROR) << "sync_load_for_tablets is not implemented";
 }
 
 void BaseBackendService::get_top_n_hot_partitions(TGetTopNHotPartitionsResponse& response,
                                                   const TGetTopNHotPartitionsRequest& request) {
-    LOG(FATAL) << "BackendService is not implemented";
+    LOG(ERROR) << "get_top_n_hot_partitions is not implemented";
 }
 
 void BaseBackendService::warm_up_tablets(TWarmUpTabletsResponse& response,
                                          const TWarmUpTabletsRequest& request) {
-    LOG(FATAL) << "BackendService is not implemented";
+    LOG(ERROR) << "warm_up_tablets is not implemented";
+    response.__set_status(Status::NotSupported("warm_up_tablets is not implemented").to_thrift());
 }
 
 } // namespace doris

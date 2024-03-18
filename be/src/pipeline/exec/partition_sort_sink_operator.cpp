@@ -28,8 +28,9 @@ OperatorPtr PartitionSortSinkOperatorBuilder::build_operator() {
 }
 
 Status PartitionSortSinkLocalState::init(RuntimeState* state, LocalSinkStateInfo& info) {
-    RETURN_IF_ERROR(PipelineXSinkLocalState<PartitionSortSinkDependency>::init(state, info));
+    RETURN_IF_ERROR(PipelineXSinkLocalState<PartitionSortNodeSharedState>::init(state, info));
     SCOPED_TIMER(exec_time_counter());
+    SCOPED_TIMER(_open_timer);
     auto& p = _parent->cast<PartitionSortSinkOperatorX>();
     RETURN_IF_ERROR(p._vsort_exec_exprs.clone(state, _vsort_exec_exprs));
     _partition_expr_ctxs.resize(p._partition_expr_ctxs.size());
@@ -44,10 +45,11 @@ Status PartitionSortSinkLocalState::init(RuntimeState* state, LocalSinkStateInfo
     _build_timer = ADD_TIMER(_profile, "HashTableBuildTime");
     _selector_block_timer = ADD_TIMER(_profile, "SelectorBlockTime");
     _emplace_key_timer = ADD_TIMER(_profile, "EmplaceKeyTime");
+    _passthrough_rows_counter = ADD_COUNTER(_profile, "PassThroughRowsCounter", TUnit::UNIT);
     _partition_sort_info = std::make_shared<vectorized::PartitionSortInfo>(
             &_vsort_exec_exprs, p._limit, 0, p._pool, p._is_asc_order, p._nulls_first,
             p._child_x->row_desc(), state, _profile, p._has_global_limit, p._partition_inner_limit,
-            p._top_n_algorithm, _shared_state->previous_row.get(), p._topn_phase);
+            p._top_n_algorithm, p._topn_phase);
     _init_hash_method();
     return Status::OK();
 }
@@ -59,7 +61,11 @@ PartitionSortSinkOperatorX::PartitionSortSinkOperatorX(ObjectPool* pool, int ope
           _pool(pool),
           _row_descriptor(descs, tnode.row_tuples, tnode.nullable_tuples),
           _limit(tnode.limit),
-          _topn_phase(tnode.partition_sort_node.ptopn_phase) {}
+          _partition_exprs_num(tnode.partition_sort_node.partition_exprs.size()),
+          _topn_phase(tnode.partition_sort_node.ptopn_phase),
+          _has_global_limit(tnode.partition_sort_node.has_global_limit),
+          _top_n_algorithm(tnode.partition_sort_node.top_n_algorithm),
+          _partition_inner_limit(tnode.partition_sort_node.partition_inner_limit) {}
 
 Status PartitionSortSinkOperatorX::init(const TPlanNode& tnode, RuntimeState* state) {
     RETURN_IF_ERROR(DataSinkOperatorX::init(tnode, state));
@@ -74,12 +80,8 @@ Status PartitionSortSinkOperatorX::init(const TPlanNode& tnode, RuntimeState* st
     if (tnode.partition_sort_node.__isset.partition_exprs) {
         RETURN_IF_ERROR(vectorized::VExpr::create_expr_trees(
                 tnode.partition_sort_node.partition_exprs, _partition_expr_ctxs));
-        _partition_exprs_num = _partition_expr_ctxs.size();
     }
 
-    _has_global_limit = tnode.partition_sort_node.has_global_limit;
-    _top_n_algorithm = tnode.partition_sort_node.top_n_algorithm;
-    _partition_inner_limit = tnode.partition_sort_node.partition_inner_limit;
     return Status::OK();
 }
 
@@ -96,18 +98,18 @@ Status PartitionSortSinkOperatorX::open(RuntimeState* state) {
 }
 
 Status PartitionSortSinkOperatorX::sink(RuntimeState* state, vectorized::Block* input_block,
-                                        SourceState source_state) {
+                                        bool eos) {
     auto& local_state = get_local_state(state);
     auto current_rows = input_block->rows();
     SCOPED_TIMER(local_state.exec_time_counter());
     if (current_rows > 0) {
+        COUNTER_UPDATE(local_state.rows_input_counter(), (int64_t)input_block->rows());
         local_state.child_input_rows = local_state.child_input_rows + current_rows;
         if (UNLIKELY(_partition_exprs_num == 0)) {
             if (UNLIKELY(local_state._value_places.empty())) {
                 local_state._value_places.push_back(_pool->add(new vectorized::PartitionBlocks(
                         local_state._partition_sort_info, local_state._value_places.empty())));
             }
-            //no partition key
             local_state._value_places[0]->append_whole_block(input_block, _child_x->row_desc());
         } else {
             //just simply use partition num to check
@@ -116,38 +118,36 @@ Status PartitionSortSinkOperatorX::sink(RuntimeState* state, vectorized::Block* 
                 local_state._num_partition > config::partition_topn_partition_threshold &&
                 local_state.child_input_rows < 10000 * local_state._num_partition) {
                 {
+                    COUNTER_UPDATE(local_state._passthrough_rows_counter,
+                                   (int64_t)input_block->rows());
                     std::lock_guard<std::mutex> lock(local_state._shared_state->buffer_mutex);
                     local_state._shared_state->blocks_buffer.push(std::move(*input_block));
                     // buffer have data, source could read this.
                     local_state._dependency->set_ready_to_read();
                 }
             } else {
-                RETURN_IF_ERROR(
-                        _split_block_by_partition(input_block, state->batch_size(), local_state));
+                RETURN_IF_ERROR(_split_block_by_partition(input_block, local_state, eos));
                 RETURN_IF_CANCELLED(state);
                 input_block->clear_column_data();
             }
         }
     }
 
-    if (source_state == SourceState::FINISHED) {
+    if (eos) {
         //seems could free for hashtable
         local_state._agg_arena_pool.reset(nullptr);
         local_state._partitioned_data.reset(nullptr);
         for (int i = 0; i < local_state._value_places.size(); ++i) {
-            auto sorter = vectorized::PartitionSorter::create_unique(
-                    _vsort_exec_exprs, _limit, 0, _pool, _is_asc_order, _nulls_first,
-                    _child_x->row_desc(), state, i == 0 ? local_state._profile : nullptr,
-                    _has_global_limit, _partition_inner_limit, _top_n_algorithm,
-                    local_state._shared_state->previous_row.get());
+            local_state._value_places[i]->create_or_reset_sorter_state();
+            auto sorter = std::move(local_state._value_places[i]->_partition_topn_sorter);
 
             DCHECK(_child_x->row_desc().num_materialized_slots() ==
-                   local_state._value_places[i]->blocks.back()->columns());
+                   local_state._value_places[i]->_blocks.back()->columns());
             //get blocks from every partition, and sorter get those data.
-            for (const auto& block : local_state._value_places[i]->blocks) {
+            for (const auto& block : local_state._value_places[i]->_blocks) {
                 RETURN_IF_ERROR(sorter->append_block(block.get()));
             }
-            sorter->init_profile(local_state._profile);
+            local_state._value_places[i]->_blocks.clear();
             RETURN_IF_ERROR(sorter->prepare_for_read());
             local_state._shared_state->partition_sorts.push_back(std::move(sorter));
         }
@@ -165,7 +165,7 @@ Status PartitionSortSinkOperatorX::sink(RuntimeState* state, vectorized::Block* 
 }
 
 Status PartitionSortSinkOperatorX::_split_block_by_partition(
-        vectorized::Block* input_block, int batch_size, PartitionSortSinkLocalState& local_state) {
+        vectorized::Block* input_block, PartitionSortSinkLocalState& local_state, bool eos) {
     for (int i = 0; i < _partition_exprs_num; ++i) {
         int result_column_id = -1;
         RETURN_IF_ERROR(_partition_expr_ctxs[i]->execute(input_block, &result_column_id));
@@ -173,15 +173,16 @@ Status PartitionSortSinkOperatorX::_split_block_by_partition(
         local_state._partition_columns[i] =
                 input_block->get_by_position(result_column_id).column.get();
     }
-    _emplace_into_hash_table(local_state._partition_columns, input_block, batch_size, local_state);
+    RETURN_IF_ERROR(_emplace_into_hash_table(local_state._partition_columns, input_block,
+                                             local_state, eos));
     return Status::OK();
 }
 
-void PartitionSortSinkOperatorX::_emplace_into_hash_table(
+Status PartitionSortSinkOperatorX::_emplace_into_hash_table(
         const vectorized::ColumnRawPtrs& key_columns, const vectorized::Block* input_block,
-        int batch_size, PartitionSortSinkLocalState& local_state) {
-    std::visit(
-            [&](auto&& agg_method) -> void {
+        PartitionSortSinkLocalState& local_state, bool eos) {
+    return std::visit(
+            [&](auto&& agg_method) -> Status {
                 SCOPED_TIMER(local_state._build_timer);
                 using HashMethodType = std::decay_t<decltype(agg_method)>;
                 using AggState = typename HashMethodType::State;
@@ -213,10 +214,9 @@ void PartitionSortSinkOperatorX::_emplace_into_hash_table(
                 }
                 for (auto* place : local_state._value_places) {
                     SCOPED_TIMER(local_state._selector_block_timer);
-                    place->append_block_by_selector(input_block, _child_x->row_desc(),
-                                                    _has_global_limit, _partition_inner_limit,
-                                                    batch_size);
+                    RETURN_IF_ERROR(place->append_block_by_selector(input_block, eos));
                 }
+                return Status::OK();
             },
             local_state._partitioned_data->method_variant);
 }
