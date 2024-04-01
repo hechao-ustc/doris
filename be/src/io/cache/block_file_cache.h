@@ -21,6 +21,7 @@
 
 #include <memory>
 #include <optional>
+#include <thread>
 
 #include "io/cache/file_block.h"
 #include "io/cache/file_cache_common.h"
@@ -29,10 +30,8 @@
 namespace doris::io {
 
 template <class Lock>
-concept IsXLock = requires {
-    std::same_as<Lock, std::lock_guard<std::mutex>> ||
-            std::same_as<Lock, std::unique_lock<std::mutex>>;
-};
+concept IsXLock = std::same_as<Lock, std::lock_guard<std::mutex>> ||
+                  std::same_as<Lock, std::unique_lock<std::mutex>>;
 
 class FSFileCacheStorage;
 
