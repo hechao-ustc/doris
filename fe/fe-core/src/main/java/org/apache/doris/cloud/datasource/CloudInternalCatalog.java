@@ -39,6 +39,7 @@ import org.apache.doris.catalog.Replica.ReplicaState;
 import org.apache.doris.catalog.ReplicaAllocation;
 import org.apache.doris.catalog.Tablet;
 import org.apache.doris.catalog.TabletMeta;
+import org.apache.doris.cloud.catalog.CloudEnv;
 import org.apache.doris.cloud.catalog.CloudPartition;
 import org.apache.doris.cloud.catalog.CloudReplica;
 import org.apache.doris.cloud.persist.UpdateCloudReplicaInfo;
@@ -48,6 +49,7 @@ import org.apache.doris.cloud.system.CloudSystemInfoService;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.MetaNotFoundException;
+import org.apache.doris.common.Pair;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.proto.OlapCommon;
 import org.apache.doris.proto.OlapFile;
@@ -65,10 +67,12 @@ import doris.segment_v2.SegmentV2;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 public class CloudInternalCatalog extends InternalCatalog {
     private static final Logger LOG = LogManager.getLogger(CloudInternalCatalog.class);
@@ -120,12 +124,8 @@ public class CloudInternalCatalog extends InternalCatalog {
         }
         long version = partition.getVisibleVersion();
 
-        final String storageVaultName = tbl.getTableProperty().getStorageVauldName();
+        final String storageVaultName = tbl.getStorageVaultName();
         boolean storageVaultIdSet = false;
-        // We don't need to set the vault name if the table has no property
-        if (storageVaultName == null || storageVaultName.isEmpty()) {
-            storageVaultIdSet = true;
-        }
 
         // short totalReplicaNum = replicaAlloc.getTotalReplicaNum();
         for (Map.Entry<Long, MaterializedIndex> entry : indexMap.entrySet()) {
@@ -157,20 +157,35 @@ public class CloudInternalCatalog extends InternalCatalog {
                         partitionId, tablet, tabletType, schemaHash, keysType, shortKeyColumnCount,
                         bfColumns, tbl.getBfFpp(), indexes, columns, tbl.getDataSortInfo(),
                         tbl.getCompressionType(), storagePolicy, isInMemory, false, tbl.getName(), tbl.getTTLSeconds(),
-                        tbl.getEnableUniqueKeyMergeOnWrite(), tbl.storeRowColumn(), indexMeta.getSchemaVersion());
+                        tbl.getEnableUniqueKeyMergeOnWrite(), tbl.storeRowColumn(), indexMeta.getSchemaVersion(),
+                        tbl.getCompactionPolicy(), tbl.getTimeSeriesCompactionGoalSizeMbytes(),
+                        tbl.getTimeSeriesCompactionFileCountThreshold(),
+                        tbl.getTimeSeriesCompactionTimeThresholdSeconds(),
+                        tbl.getTimeSeriesCompactionEmptyRowsetsThreshold(),
+                        tbl.getTimeSeriesCompactionLevelThreshold());
                 requestBuilder.addTabletMetas(builder);
             }
-            if (!storageVaultIdSet) {
+            if (!storageVaultIdSet && ((CloudEnv) Env.getCurrentEnv()).getEnableStorageVault()) {
                 requestBuilder.setStorageVaultName(storageVaultName);
             }
 
             LOG.info("create tablets, dbId: {}, tableId: {}, tableName: {}, partitionId: {}, partitionName: {}, "
-                    + "indexId: {}",
-                    dbId, tbl.getId(), tbl.getName(), partitionId, partitionName, indexId);
+                    + "indexId: {}, vault name {}",
+                    dbId, tbl.getId(), tbl.getName(), partitionId, partitionName, indexId, storageVaultName);
             Cloud.CreateTabletsResponse resp = sendCreateTabletsRpc(requestBuilder);
+            // If the resp has no vault id set, it means the MS is running with enable_storage_vault false
             if (resp.hasStorageVaultId() && !storageVaultIdSet) {
-                tbl.getTableProperty().setStorageVaultId(resp.getStorageVaultId());
+                tbl.setStorageVaultId(resp.getStorageVaultId());
                 storageVaultIdSet = true;
+                if (storageVaultName.isEmpty()) {
+                    // If user doesn't specify the vault name for this table, we should set it
+                    // to make the show create table stmt return correct stmt
+                    // TODO(ByteYue): setDefaultStorageVault for vaultMgr might override user's
+                    // defualt vault, maybe we should set it using show default storage vault stmt
+                    tbl.setStorageVaultName(resp.getStorageVaultName());
+                    Env.getCurrentEnv().getStorageVaultMgr().setDefaultStorageVault(
+                            Pair.of(resp.getStorageVaultName(), resp.getStorageVaultId()));
+                }
             }
             if (index.getId() != tbl.getBaseIndexId()) {
                 // add rollup index to partition
@@ -178,8 +193,8 @@ public class CloudInternalCatalog extends InternalCatalog {
             }
         }
 
-        LOG.info("succeed in creating partition[{}-{}], table : [{}-{}]", partitionId, partitionName,
-                tbl.getId(), tbl.getName());
+        LOG.info("succeed in creating partition[{}-{}], table : [{}-{}], vault {}", partitionId, partitionName,
+                tbl.getId(), tbl.getName(), tbl.getStorageVaultName());
 
         return partition;
     }
@@ -190,7 +205,10 @@ public class CloudInternalCatalog extends InternalCatalog {
             List<Column> schemaColumns, DataSortInfo dataSortInfo, TCompressionType compressionType,
             String storagePolicy, boolean isInMemory, boolean isShadow,
             String tableName, long ttlSeconds, boolean enableUniqueKeyMergeOnWrite,
-            boolean storeRowColumn, int schemaVersion) throws DdlException {
+            boolean storeRowColumn, int schemaVersion, String compactionPolicy,
+            Long timeSeriesCompactionGoalSizeMbytes, Long timeSeriesCompactionFileCountThreshold,
+            Long timeSeriesCompactionTimeThresholdSeconds, Long timeSeriesCompactionEmptyRowsetsThreshold,
+            Long timeSeriesCompactionLevelThreshold) throws DdlException {
         OlapFile.TabletMetaCloudPB.Builder builder = OlapFile.TabletMetaCloudPB.newBuilder();
         builder.setTableId(tableId);
         builder.setIndexId(indexId);
@@ -218,6 +236,13 @@ public class CloudInternalCatalog extends InternalCatalog {
 
         builder.setReplicaId(tablet.getReplicas().get(0).getId());
         builder.setEnableUniqueKeyMergeOnWrite(enableUniqueKeyMergeOnWrite);
+
+        builder.setCompactionPolicy(compactionPolicy);
+        builder.setTimeSeriesCompactionGoalSizeMbytes(timeSeriesCompactionGoalSizeMbytes);
+        builder.setTimeSeriesCompactionFileCountThreshold(timeSeriesCompactionFileCountThreshold);
+        builder.setTimeSeriesCompactionTimeThresholdSeconds(timeSeriesCompactionTimeThresholdSeconds);
+        builder.setTimeSeriesCompactionEmptyRowsetsThreshold(timeSeriesCompactionEmptyRowsetsThreshold);
+        builder.setTimeSeriesCompactionLevelThreshold(timeSeriesCompactionLevelThreshold);
 
         OlapFile.TabletSchemaCloudPB.Builder schemaBuilder = OlapFile.TabletSchemaCloudPB.newBuilder();
         schemaBuilder.setSchemaVersion(schemaVersion);
@@ -593,7 +618,7 @@ public class CloudInternalCatalog extends InternalCatalog {
 
         long tableId = -1;
         List<Long> partitionIds = Lists.newArrayList();
-        List<Long> indexIds = Lists.newArrayList();
+        Set<Long> indexIds = new HashSet<>();
         for (Partition partition : partitions) {
             for (MaterializedIndex index : partition.getMaterializedIndices(IndexExtState.ALL)) {
                 indexIds.add(index.getId());
@@ -614,7 +639,8 @@ public class CloudInternalCatalog extends InternalCatalog {
                 break;
             }
             try {
-                dropCloudPartition(partition0.getDbId(), tableId, partitionIds, indexIds);
+                dropCloudPartition(partition0.getDbId(), tableId, partitionIds,
+                        indexIds.stream().collect(Collectors.toList()));
             } catch (Exception e) {
                 LOG.warn("failed to drop partition {} of table {}, try cnt {}, execption {}",
                         partitionIds, tableId, tryCnt, e);
@@ -693,6 +719,37 @@ public class CloudInternalCatalog extends InternalCatalog {
             LOG.warn("dropIndex response: {} ", response);
             throw new DdlException(response.getStatus().getMsg());
         }
+    }
+
+    /**
+     * for cloud mode, drop rollup/materializedIndex in kv meta store
+     * @param tableId
+     * @param indexIdList
+     */
+    public void eraseDroppedIndex(long tableId, List<Long> indexIdList) {
+        if (indexIdList == null || indexIdList.size() == 0) {
+            LOG.warn("indexIdList is empty");
+            return;
+        }
+        long tryCnt = 0;
+        while (true) {
+            if (tryCnt++ > Config.drop_rpc_retry_num) {
+                LOG.warn("failed to drop index {} of table {}, try cnt {} reaches maximum retry count",
+                            indexIdList, tableId, tryCnt);
+                break;
+            }
+
+            try {
+                dropMaterializedIndex(tableId, indexIdList, false);
+                break;
+            } catch (Exception e) {
+                LOG.warn("tryCnt:{}, eraseDroppedIndex exception:", tryCnt, e);
+            }
+            sleepSeveralMs();
+        }
+
+        LOG.info("eraseDroppedIndex finished, tableId:{}, indexIdList:{}",
+                tableId, indexIdList);
     }
 
     // END DROP TABLE

@@ -168,6 +168,7 @@ public:
         thread_mem_tracker_mgr->attach_limiter_tracker(mem_tracker);
         thread_mem_tracker_mgr->set_query_id(_task_id);
         thread_mem_tracker_mgr->enable_wait_gc();
+        thread_mem_tracker_mgr->reset_query_cancelled_flag(false);
     }
 
     void detach_task() {
@@ -446,7 +447,7 @@ private:
 // must call create_thread_local_if_not_exits() before use thread_context().
 #define CONSUME_THREAD_MEM_TRACKER(size)                                                           \
     do {                                                                                           \
-        if (doris::use_mem_hook || size == 0) {                                                    \
+        if (size == 0 || doris::use_mem_hook) {                                                    \
             break;                                                                                 \
         }                                                                                          \
         if (doris::pthread_context_ptr_init) {                                                     \

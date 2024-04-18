@@ -51,6 +51,7 @@ import org.apache.doris.nereids.rules.rewrite.CountDistinctRewrite;
 import org.apache.doris.nereids.rules.rewrite.CountLiteralRewrite;
 import org.apache.doris.nereids.rules.rewrite.CreatePartitionTopNFromWindow;
 import org.apache.doris.nereids.rules.rewrite.DeferMaterializeTopNResult;
+import org.apache.doris.nereids.rules.rewrite.EliminateAggCaseWhen;
 import org.apache.doris.nereids.rules.rewrite.EliminateAggregate;
 import org.apache.doris.nereids.rules.rewrite.EliminateAssertNumRows;
 import org.apache.doris.nereids.rules.rewrite.EliminateDedupJoinCondition;
@@ -117,6 +118,7 @@ import org.apache.doris.nereids.rules.rewrite.PushFilterInsideJoin;
 import org.apache.doris.nereids.rules.rewrite.PushProjectIntoOneRowRelation;
 import org.apache.doris.nereids.rules.rewrite.PushProjectIntoUnion;
 import org.apache.doris.nereids.rules.rewrite.PushProjectThroughUnion;
+import org.apache.doris.nereids.rules.rewrite.ReduceAggregateChildOutputRows;
 import org.apache.doris.nereids.rules.rewrite.ReorderJoin;
 import org.apache.doris.nereids.rules.rewrite.RewriteCteChildren;
 import org.apache.doris.nereids.rules.rewrite.SplitLimit;
@@ -203,6 +205,8 @@ public class Rewriter extends AbstractBatchJobExecutor {
                             new EliminateLimit(),
                             new EliminateFilter(),
                             new EliminateAggregate(),
+                            new EliminateAggCaseWhen(),
+                            new ReduceAggregateChildOutputRows(),
                             new EliminateJoinCondition(),
                             new EliminateAssertNumRows(),
                             new EliminateSemiJoin()

@@ -191,10 +191,14 @@ public:
     }
 
     void insert_range_of_integer(T begin, T end) {
-        auto old_size = data.size();
-        data.resize(old_size + (end - begin));
-        for (int i = 0; i < end - begin; i++) {
-            data[old_size + i] = begin + i;
+        if constexpr (std::is_integral_v<T>) {
+            auto old_size = data.size();
+            data.resize(old_size + (end - begin));
+            for (int i = 0; i < end - begin; i++) {
+                data[old_size + i] = begin + i;
+            }
+        } else {
+            LOG(FATAL) << "double column not support insert_range_of_integer";
         }
     }
 
@@ -404,14 +408,13 @@ public:
 
     ColumnPtr replicate(const IColumn::Offsets& offsets) const override;
 
-    MutableColumns scatter(IColumn::ColumnIndex num_columns,
-                           const IColumn::Selector& selector) const override {
-        return this->template scatter_impl<Self>(num_columns, selector);
-    }
-
     void append_data_by_selector(MutableColumnPtr& res,
                                  const IColumn::Selector& selector) const override {
         this->template append_data_by_selector_impl<Self>(res, selector);
+    }
+    void append_data_by_selector(MutableColumnPtr& res, const IColumn::Selector& selector,
+                                 size_t begin, size_t end) const override {
+        this->template append_data_by_selector_impl<Self>(res, selector, begin, end);
     }
 
     bool is_fixed_and_contiguous() const override { return true; }
