@@ -123,7 +123,7 @@ MemTrackerLimiter::~MemTrackerLimiter() {
 #ifdef NDEBUG
             LOG(INFO) << err_msg;
 #else
-            LOG(FATAL) << err_msg << print_address_sanitizers();
+            LOG(INFO) << err_msg << print_address_sanitizers();
 #endif
         }
         if (ExecEnv::tracking_memory()) {
@@ -132,10 +132,10 @@ MemTrackerLimiter::~MemTrackerLimiter() {
         _consumption->set(0);
 #ifndef NDEBUG
     } else if (!_address_sanitizers.empty()) {
-        LOG(FATAL) << "[Address Sanitizer] consumption is 0, but address sanitizers not empty. "
-                   << ", mem tracker label: " << _label
-                   << ", peak consumption: " << _consumption->peak_value()
-                   << print_address_sanitizers();
+        LOG(INFO) << "[Address Sanitizer] consumption is 0, but address sanitizers not empty. "
+                  << ", mem tracker label: " << _label
+                  << ", peak consumption: " << _consumption->peak_value()
+                  << print_address_sanitizers();
 #endif
     }
     g_memtrackerlimiter_cnt << -1;
@@ -147,18 +147,18 @@ void MemTrackerLimiter::add_address_sanitizers(void* buf, size_t size) {
         std::lock_guard<std::mutex> l(_address_sanitizers_mtx);
         auto it = _address_sanitizers.find(buf);
         if (it != _address_sanitizers.end()) {
-            LOG(FATAL) << "[Address Sanitizer] memory buf repeat add, mem tracker label: " << _label
-                       << ", consumption: " << _consumption->current_value()
-                       << ", peak consumption: " << _consumption->peak_value() << ", buf: " << buf
-                       << ", size: " << size << ", old buf: " << it->first
-                       << ", old size: " << it->second.size
-                       << ", new stack_trace: " << get_stack_trace()
-                       << ", old stack_trace: " << it->second.stack_trace;
+            LOG(INFO) << "[Address Sanitizer] memory buf repeat add, mem tracker label: " << _label
+                      << ", consumption: " << _consumption->current_value()
+                      << ", peak consumption: " << _consumption->peak_value() << ", buf: " << buf
+                      << ", size: " << size << ", old buf: " << it->first
+                      << ", old size: " << it->second.size
+                      << ", new stack_trace: " << get_stack_trace(1, "DISABLED")
+                      << ", old stack_trace: " << it->second.stack_trace;
         }
 
         // if alignment not equal to 0, maybe usable_size > size.
         AddressSanitizer as = {size, doris::config::enable_address_sanitizers_with_stack_trace
-                                             ? get_stack_trace()
+                                             ? get_stack_trace(1, "DISABLED")
                                              : ""};
         _address_sanitizers.emplace(buf, as);
     }
@@ -170,21 +170,21 @@ void MemTrackerLimiter::remove_address_sanitizers(void* buf, size_t size) {
         auto it = _address_sanitizers.find(buf);
         if (it != _address_sanitizers.end()) {
             if (it->second.size != size) {
-                LOG(FATAL) << "[Address Sanitizer] free memory buf size inaccurate, mem tracker "
-                              "label: "
-                           << _label << ", consumption: " << _consumption->current_value()
-                           << ", peak consumption: " << _consumption->peak_value()
-                           << ", buf: " << buf << ", size: " << size << ", old buf: " << it->first
-                           << ", old size: " << it->second.size
-                           << ", new stack_trace: " << get_stack_trace()
-                           << ", old stack_trace: " << it->second.stack_trace;
+                LOG(INFO) << "[Address Sanitizer] free memory buf size inaccurate, mem tracker "
+                             "label: "
+                          << _label << ", consumption: " << _consumption->current_value()
+                          << ", peak consumption: " << _consumption->peak_value()
+                          << ", buf: " << buf << ", size: " << size << ", old buf: " << it->first
+                          << ", old size: " << it->second.size
+                          << ", new stack_trace: " << get_stack_trace(1, "DISABLED")
+                          << ", old stack_trace: " << it->second.stack_trace;
             }
             _address_sanitizers.erase(buf);
         } else {
-            LOG(FATAL) << "[Address Sanitizer] memory buf not exist, mem tracker label: " << _label
-                       << ", consumption: " << _consumption->current_value()
-                       << ", peak consumption: " << _consumption->peak_value() << ", buf: " << buf
-                       << ", size: " << size << ", stack_trace: " << get_stack_trace();
+            LOG(INFO) << "[Address Sanitizer] memory buf not exist, mem tracker label: " << _label
+                      << ", consumption: " << _consumption->current_value()
+                      << ", peak consumption: " << _consumption->peak_value() << ", buf: " << buf
+                      << ", size: " << size << ", stack_trace: " << get_stack_trace(1, "DISABLED");
         }
     }
 }
@@ -600,8 +600,8 @@ int64_t MemTrackerLimiter::free_top_memory_query(
                 continue;
             }
             ExecEnv::GetInstance()->fragment_mgr()->cancel_query(
-                    cancelled_queryid, PPlanFragmentCancelReason::MEMORY_LIMIT_EXCEED,
-                    cancel_msg(min_pq.top().first, min_pq.top().second));
+                    cancelled_queryid, Status::MemoryLimitExceeded(cancel_msg(
+                                               min_pq.top().first, min_pq.top().second)));
 
             COUNTER_UPDATE(freed_memory_counter, min_pq.top().first);
             COUNTER_UPDATE(cancel_tasks_counter, 1);
@@ -728,8 +728,8 @@ int64_t MemTrackerLimiter::free_top_overcommit_query(
             }
             int64_t query_mem = query_consumption[max_pq.top().second];
             ExecEnv::GetInstance()->fragment_mgr()->cancel_query(
-                    cancelled_queryid, PPlanFragmentCancelReason::MEMORY_LIMIT_EXCEED,
-                    cancel_msg(query_mem, max_pq.top().second));
+                    cancelled_queryid,
+                    Status::MemoryLimitExceeded(cancel_msg(query_mem, max_pq.top().second)));
 
             usage_strings.push_back(fmt::format("{} memory used {} Bytes, overcommit ratio: {}",
                                                 max_pq.top().second, query_mem,

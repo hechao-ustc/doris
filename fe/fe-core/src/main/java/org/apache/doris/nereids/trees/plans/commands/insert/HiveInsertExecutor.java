@@ -35,10 +35,12 @@ import org.apache.doris.planner.PlanFragment;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.qe.QueryState;
 import org.apache.doris.qe.StmtExecutor;
+import org.apache.doris.thrift.TUniqueId;
 import org.apache.doris.transaction.TransactionManager;
 import org.apache.doris.transaction.TransactionStatus;
 import org.apache.doris.transaction.TransactionType;
 
+import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -62,8 +64,8 @@ public class HiveInsertExecutor extends AbstractInsertExecutor {
      */
     public HiveInsertExecutor(ConnectContext ctx, HMSExternalTable table,
                               String labelName, NereidsPlanner planner,
-                              Optional<InsertCommandContext> insertCtx) {
-        super(ctx, table, labelName, planner, insertCtx);
+                              Optional<InsertCommandContext> insertCtx, boolean emptyInsert) {
+        super(ctx, table, labelName, planner, insertCtx, emptyInsert);
         catalogName = table.getCatalog().getName();
         transactionManager = table.getCatalog().getTransactionManager();
 
@@ -97,6 +99,13 @@ public class HiveInsertExecutor extends AbstractInsertExecutor {
     @Override
     protected void beforeExec() {
         // check params
+        HMSTransaction transaction = (HMSTransaction) transactionManager.getTransaction(txnId);
+        Preconditions.checkArgument(insertCtx.isPresent(), "insert context must be present");
+        HiveInsertCommandContext ctx = (HiveInsertCommandContext) insertCtx.get();
+        TUniqueId tUniqueId = ConnectContext.get().queryId();
+        Preconditions.checkArgument(tUniqueId != null, "query id shouldn't be null");
+        ctx.setQueryId(DebugUtil.printId(tUniqueId));
+        transaction.beginInsertTable(ctx);
     }
 
     @Override
