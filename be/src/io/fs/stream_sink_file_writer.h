@@ -18,7 +18,7 @@
 #pragma once
 
 #include <brpc/stream.h>
-#include <gen_cpp/internal_service.pb.h>
+#include <gen_cpp/olap_common.pb.h>
 
 #include <queue>
 
@@ -40,13 +40,13 @@ public:
             : _streams(std::move(streams)) {}
 
     void init(PUniqueId load_id, int64_t partition_id, int64_t index_id, int64_t tablet_id,
-              int32_t segment_id);
+              int32_t segment_id, FileType file_type = FileType::SEGMENT_FILE);
 
     Status appendv(const Slice* data, size_t data_cnt) override;
 
     size_t bytes_appended() const override { return _bytes_appended; }
 
-    FileWriterState closed() const override { return _close_state; }
+    State state() const override { return _state; }
 
     // FIXME(plat1ko): Maybe it's an inappropriate abstraction?
     const Path& path() const override {
@@ -68,7 +68,8 @@ private:
     int64_t _tablet_id;
     int32_t _segment_id;
     size_t _bytes_appended = 0;
-    FileWriterState _close_state {FileWriterState::OPEN};
+    State _state {State::OPENED};
+    FileType _file_type {FileType::SEGMENT_FILE};
 };
 
 } // namespace io
