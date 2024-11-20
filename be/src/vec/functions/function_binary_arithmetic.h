@@ -413,9 +413,13 @@ public:
                                                      const ResultType& max_result_number,
                                                      const ResultType& scale_diff_multiplier,
                                                      DataTypePtr res_data_type) {
-        auto type_result = assert_cast<const DataTypeDecimal<ResultType>&>(*res_data_type);
+        auto type_result =
+                assert_cast<const DataTypeDecimal<ResultType>&, TypeCheckOnRelease::DISABLE>(
+                        *res_data_type);
         auto column_result = ColumnDecimal<ResultType>::create(
-                1, assert_cast<const DataTypeDecimal<ResultType>&>(*res_data_type).get_scale());
+                1, assert_cast<const DataTypeDecimal<ResultType>&, TypeCheckOnRelease::DISABLE>(
+                           *res_data_type)
+                           .get_scale());
 
         if constexpr (check_overflow && !is_to_null_type &&
                       ((!OpTraits::is_multiply && !OpTraits::is_plus_minus))) {
@@ -441,11 +445,15 @@ public:
                                                    const ResultType& max_result_number,
                                                    const ResultType& scale_diff_multiplier,
                                                    DataTypePtr res_data_type) {
-        auto type_result = assert_cast<const DataTypeDecimal<ResultType>&>(*res_data_type);
+        auto type_result =
+                assert_cast<const DataTypeDecimal<ResultType>&, TypeCheckOnRelease::DISABLE>(
+                        *res_data_type);
         auto column_left_ptr = check_and_get_column<typename Traits::ColumnVectorA>(column_left);
         auto column_result = ColumnDecimal<ResultType>::create(
                 column_left->size(),
-                assert_cast<const DataTypeDecimal<ResultType>&>(*res_data_type).get_scale());
+                assert_cast<const DataTypeDecimal<ResultType>&, TypeCheckOnRelease::DISABLE>(
+                        *res_data_type)
+                        .get_scale());
         DCHECK(column_left_ptr != nullptr);
 
         if constexpr (check_overflow && !is_to_null_type &&
@@ -472,11 +480,15 @@ public:
                                                    const ResultType& max_result_number,
                                                    const ResultType& scale_diff_multiplier,
                                                    DataTypePtr res_data_type) {
-        auto type_result = assert_cast<const DataTypeDecimal<ResultType>&>(*res_data_type);
+        auto type_result =
+                assert_cast<const DataTypeDecimal<ResultType>&, TypeCheckOnRelease::DISABLE>(
+                        *res_data_type);
         auto column_right_ptr = check_and_get_column<typename Traits::ColumnVectorB>(column_right);
         auto column_result = ColumnDecimal<ResultType>::create(
                 column_right->size(),
-                assert_cast<const DataTypeDecimal<ResultType>&>(*res_data_type).get_scale());
+                assert_cast<const DataTypeDecimal<ResultType>&, TypeCheckOnRelease::DISABLE>(
+                        *res_data_type)
+                        .get_scale());
         DCHECK(column_right_ptr != nullptr);
 
         if constexpr (check_overflow && !is_to_null_type &&
@@ -1018,7 +1030,7 @@ public:
     }
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) const override {
+                        uint32_t result, size_t input_rows_count) const override {
         auto* left_generic = block.get_by_position(arguments[0]).type.get();
         auto* right_generic = block.get_by_position(arguments[1]).type.get();
         auto* result_generic = block.get_by_position(result).type.get();

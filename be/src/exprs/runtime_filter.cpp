@@ -22,7 +22,6 @@
 #include <gen_cpp/PlanNodes_types.h>
 #include <gen_cpp/Types_types.h>
 #include <gen_cpp/internal_service.pb.h>
-#include <stddef.h>
 
 #include <algorithm>
 // IWYU pragma: no_include <bits/chrono.h>
@@ -110,11 +109,14 @@ PColumnType to_proto(PrimitiveType type) {
         return PColumnType::COLUMN_TYPE_VARCHAR;
     case TYPE_STRING:
         return PColumnType::COLUMN_TYPE_STRING;
+    case TYPE_IPV4:
+        return PColumnType::COLUMN_TYPE_IPV4;
+    case TYPE_IPV6:
+        return PColumnType::COLUMN_TYPE_IPV6;
     default:
-        DCHECK(false) << "Invalid type.";
+        throw Exception(ErrorCode::INTERNAL_ERROR,
+                        "runtime filter meet invalid PrimitiveType type {}", int(type));
     }
-    DCHECK(false);
-    return PColumnType::COLUMN_TYPE_INT;
 }
 
 // PColumnType->PrimitiveType
@@ -160,10 +162,14 @@ PrimitiveType to_primitive_type(PColumnType type) {
         return TYPE_CHAR;
     case PColumnType::COLUMN_TYPE_STRING:
         return TYPE_STRING;
+    case PColumnType::COLUMN_TYPE_IPV4:
+        return TYPE_IPV4;
+    case PColumnType::COLUMN_TYPE_IPV6:
+        return TYPE_IPV6;
     default:
-        DCHECK(false);
+        throw Exception(ErrorCode::INTERNAL_ERROR,
+                        "runtime filter meet invalid PColumnType type {}", int(type));
     }
-    return TYPE_INT;
 }
 
 // PFilterType -> RuntimeFilterType
@@ -465,10 +471,10 @@ public:
                           const TExpr& probe_expr);
 
     Status merge(const RuntimePredicateWrapper* wrapper) {
-        if (is_ignored() || wrapper->is_ignored()) {
-            _context->ignored = true;
+        if (wrapper->is_ignored()) {
             return Status::OK();
         }
+        _context->ignored = false;
 
         bool can_not_merge_in_or_bloom =
                 _filter_type == RuntimeFilterType::IN_OR_BLOOM_FILTER &&
@@ -486,7 +492,10 @@ public:
 
         switch (_filter_type) {
         case RuntimeFilterType::IN_FILTER: {
-            // try insert set
+            if (!_context->hybrid_set) {
+                _context->ignored = true;
+                return Status::OK();
+            }
             _context->hybrid_set->insert(wrapper->_context->hybrid_set.get());
             if (_max_in_num >= 0 && _context->hybrid_set->size() >= _max_in_num) {
                 _context->ignored = true;
@@ -554,14 +563,13 @@ public:
     }
 
     Status assign(const PInFilter* in_filter, bool contain_null) {
-        PrimitiveType type = to_primitive_type(in_filter->column_type());
-        _context->hybrid_set.reset(create_set(type));
+        _context->hybrid_set.reset(create_set(_column_return_type));
         if (contain_null) {
             _context->hybrid_set->set_null_aware(true);
             _context->hybrid_set->insert((const void*)nullptr);
         }
 
-        switch (type) {
+        switch (_column_return_type) {
         case TYPE_BOOLEAN: {
             batch_assign(in_filter, [](std::shared_ptr<HybridSetBase>& set, PColumnValue& column) {
                 bool bool_val = column.boolval();
@@ -701,9 +709,27 @@ public:
             });
             break;
         }
+        case TYPE_IPV4: {
+            batch_assign(in_filter, [](std::shared_ptr<HybridSetBase>& set, PColumnValue& column) {
+                int32_t tmp = column.intval();
+                set->insert(&tmp);
+            });
+            break;
+        }
+        case TYPE_IPV6: {
+            batch_assign(in_filter, [](std::shared_ptr<HybridSetBase>& set, PColumnValue& column) {
+                auto string_val = column.stringval();
+                StringParser::ParseResult result;
+                auto int128_val = StringParser::string_to_int<uint128_t>(
+                        string_val.c_str(), string_val.length(), &result);
+                DCHECK(result == StringParser::PARSE_SUCCESS);
+                set->insert(&int128_val);
+            });
+            break;
+        }
         default: {
             return Status::InternalError("not support assign to in filter, type: " +
-                                         type_to_string(type));
+                                         type_to_string(_column_return_type));
         }
         }
         return Status::OK();
@@ -726,15 +752,14 @@ public:
     // used by shuffle runtime filter
     // assign this filter by protobuf
     Status assign(const PMinMaxFilter* minmax_filter, bool contain_null) {
-        PrimitiveType type = to_primitive_type(minmax_filter->column_type());
-        _context->minmax_func.reset(create_minmax_filter(type));
+        _context->minmax_func.reset(create_minmax_filter(_column_return_type));
 
         if (contain_null) {
             _context->minmax_func->set_null_aware(true);
             _context->minmax_func->set_contain_null();
         }
 
-        switch (type) {
+        switch (_column_return_type) {
         case TYPE_BOOLEAN: {
             bool min_val = minmax_filter->min_val().boolval();
             bool max_val = minmax_filter->max_val().boolval();
@@ -850,6 +875,23 @@ public:
             auto max_val_ref = minmax_filter->max_val().stringval();
             return _context->minmax_func->assign(&min_val_ref, &max_val_ref);
         }
+        case TYPE_IPV4: {
+            int tmp_min = minmax_filter->min_val().intval();
+            int tmp_max = minmax_filter->max_val().intval();
+            return _context->minmax_func->assign(&tmp_min, &tmp_max);
+        }
+        case TYPE_IPV6: {
+            auto min_string_val = minmax_filter->min_val().stringval();
+            auto max_string_val = minmax_filter->max_val().stringval();
+            StringParser::ParseResult result;
+            auto min_val = StringParser::string_to_int<uint128_t>(min_string_val.c_str(),
+                                                                  min_string_val.length(), &result);
+            DCHECK(result == StringParser::PARSE_SUCCESS);
+            auto max_val = StringParser::string_to_int<uint128_t>(max_string_val.c_str(),
+                                                                  max_string_val.length(), &result);
+            DCHECK(result == StringParser::PARSE_SUCCESS);
+            return _context->minmax_func->assign(&min_val, &max_val);
+        }
         default:
             break;
         }
@@ -933,8 +975,8 @@ private:
 Status IRuntimeFilter::create(RuntimeFilterParamsContext* state, const TRuntimeFilterDesc* desc,
                               const TQueryOptions* query_options, const RuntimeFilterRole role,
                               int node_id, std::shared_ptr<IRuntimeFilter>* res,
-                              bool build_bf_exactly, bool need_local_merge) {
-    *res = std::make_shared<IRuntimeFilter>(state, desc, need_local_merge);
+                              bool build_bf_exactly) {
+    *res = std::make_shared<IRuntimeFilter>(state, desc);
     (*res)->set_role(role);
     return (*res)->init_with_desc(desc, query_options, node_id, build_bf_exactly);
 }
@@ -948,20 +990,20 @@ void IRuntimeFilter::insert_batch(const vectorized::ColumnPtr column, size_t sta
     _wrapper->insert_batch(column, start);
 }
 
-Status IRuntimeFilter::publish(bool publish_local) {
+Status IRuntimeFilter::publish(RuntimeState* state, bool publish_local) {
     DCHECK(is_producer());
 
-    auto send_to_remote = [&](IRuntimeFilter* filter) {
+    auto send_to_remote_targets = [&](IRuntimeFilter* filter) {
         TNetworkAddress addr;
         DCHECK(_state != nullptr);
-        RETURN_IF_ERROR(_state->runtime_filter_mgr->get_merge_addr(&addr));
-        return filter->push_to_remote(&addr);
+        RETURN_IF_ERROR(_state->global_runtime_filter_mgr()->get_merge_addr(&addr));
+        return filter->push_to_remote(state, &addr);
     };
-    auto send_to_local = [&](std::shared_ptr<RuntimePredicateWrapper> wrapper) {
-        std::vector<std::shared_ptr<IRuntimeFilter>> filters;
-        RETURN_IF_ERROR(_state->runtime_filter_mgr->get_consume_filters(_filter_id, filters));
-        DCHECK(!filters.empty());
-        // push down
+    auto send_to_local_targets = [&](std::shared_ptr<RuntimePredicateWrapper> wrapper,
+                                     bool global) {
+        std::vector<std::shared_ptr<IRuntimeFilter>> filters =
+                global ? _state->global_runtime_filter_mgr()->get_consume_filters(_filter_id)
+                       : _state->local_runtime_filter_mgr()->get_consume_filters(_filter_id);
         for (auto filter : filters) {
             filter->_wrapper = wrapper;
             filter->update_runtime_filter_type_to_profile();
@@ -969,32 +1011,36 @@ Status IRuntimeFilter::publish(bool publish_local) {
         }
         return Status::OK();
     };
-    auto do_local_merge = [&]() {
-        LocalMergeFilters* local_merge_filters = nullptr;
-        RETURN_IF_ERROR(_state->runtime_filter_mgr->get_local_merge_producer_filters(
-                _filter_id, &local_merge_filters));
-        std::lock_guard l(*local_merge_filters->lock);
-        RETURN_IF_ERROR(local_merge_filters->filters[0]->merge_from(_wrapper.get()));
-        local_merge_filters->merge_time--;
-        if (local_merge_filters->merge_time == 0) {
-            if (_has_local_target) {
-                RETURN_IF_ERROR(send_to_local(local_merge_filters->filters[0]->_wrapper));
-            } else {
-                RETURN_IF_ERROR(send_to_remote(local_merge_filters->filters[0].get()));
+    auto do_merge = [&]() {
+        if (!_state->global_runtime_filter_mgr()->get_consume_filters(_filter_id).empty()) {
+            LocalMergeFilters* local_merge_filters = nullptr;
+            RETURN_IF_ERROR(_state->global_runtime_filter_mgr()->get_local_merge_producer_filters(
+                    _filter_id, &local_merge_filters));
+            std::lock_guard l(*local_merge_filters->lock);
+            RETURN_IF_ERROR(local_merge_filters->filters[0]->merge_from(_wrapper.get()));
+            local_merge_filters->merge_time--;
+            if (local_merge_filters->merge_time == 0) {
+                if (_has_local_target) {
+                    RETURN_IF_ERROR(
+                            send_to_local_targets(local_merge_filters->filters[0]->_wrapper, true));
+                } else {
+                    RETURN_IF_ERROR(send_to_remote_targets(local_merge_filters->filters[0].get()));
+                }
             }
         }
         return Status::OK();
     };
 
-    if (_need_local_merge && _has_local_target) {
-        RETURN_IF_ERROR(do_local_merge());
-    } else if (_has_local_target) {
-        RETURN_IF_ERROR(send_to_local(_wrapper));
+    if (_has_local_target) {
+        // A runtime filter may have multiple targets and some of those are local-merge RF and others are not.
+        // So for all runtime filters' producers, `publish` should notify all consumers in global RF mgr which manages local-merge RF and local RF mgr which manages others.
+        RETURN_IF_ERROR(do_merge());
+        RETURN_IF_ERROR(send_to_local_targets(_wrapper, false));
     } else if (!publish_local) {
-        if (_is_broadcast_join || _state->be_exec_version < USE_NEW_SERDE) {
-            RETURN_IF_ERROR(send_to_remote(this));
+        if (_is_broadcast_join || _state->get_query_ctx()->be_exec_version() < USE_NEW_SERDE) {
+            RETURN_IF_ERROR(send_to_remote_targets(this));
         } else {
-            RETURN_IF_ERROR(do_local_merge());
+            RETURN_IF_ERROR(do_merge());
         }
     } else {
         // remote broadcast join only push onetime in build shared hash table
@@ -1011,30 +1057,33 @@ class SyncSizeClosure : public AutoReleaseClosure<PSendFilterSizeRequest,
     // context, it not the memory is not released. And rpc is in another thread, it will hold rf context
     // after query context because the rpc is not returned.
     std::weak_ptr<RuntimeFilterContext> _rf_context;
-    std::string _rf_debug_info;
     using Base =
             AutoReleaseClosure<PSendFilterSizeRequest, DummyBrpcCallback<PSendFilterSizeResponse>>;
     ENABLE_FACTORY_CREATOR(SyncSizeClosure);
 
     void _process_if_rpc_failed() override {
-        ((pipeline::CountedFinishDependency*)_dependency.get())->sub();
-        LOG(WARNING) << "sync filter size meet rpc error, filter=" << _rf_debug_info;
+        Defer defer {[&]() { ((pipeline::CountedFinishDependency*)_dependency.get())->sub(); }};
+        auto ctx = _rf_context.lock();
+        if (!ctx) {
+            return;
+        }
+
+        ctx->err_msg = cntl_->ErrorText();
         Base::_process_if_rpc_failed();
     }
 
     void _process_if_meet_error_status(const Status& status) override {
-        ((pipeline::CountedFinishDependency*)_dependency.get())->sub();
+        Defer defer {[&]() { ((pipeline::CountedFinishDependency*)_dependency.get())->sub(); }};
+        auto ctx = _rf_context.lock();
+        if (!ctx) {
+            return;
+        }
+
         if (status.is<ErrorCode::END_OF_FILE>()) {
             // rf merger backend may finished before rf's send_filter_size, we just ignore filter in this case.
-            auto ctx = _rf_context.lock();
-            if (ctx) {
-                ctx->ignored = true;
-            } else {
-                LOG(WARNING) << "sync filter size returned but context is released, filter="
-                             << _rf_debug_info;
-            }
+            ctx->ignored = true;
         } else {
-            LOG(WARNING) << "sync filter size meet error status, filter=" << _rf_debug_info;
+            ctx->err_msg = status.to_string();
             Base::_process_if_meet_error_status(status);
         }
     }
@@ -1043,23 +1092,25 @@ public:
     SyncSizeClosure(std::shared_ptr<PSendFilterSizeRequest> req,
                     std::shared_ptr<DummyBrpcCallback<PSendFilterSizeResponse>> callback,
                     std::shared_ptr<pipeline::Dependency> dependency,
-                    RuntimeFilterContextSPtr rf_context, std::string_view rf_debug_info)
-            : Base(req, callback),
+                    RuntimeFilterContextSPtr rf_context, std::weak_ptr<QueryContext> context)
+            : Base(req, callback, context),
               _dependency(std::move(dependency)),
-              _rf_context(rf_context),
-              _rf_debug_info(rf_debug_info) {}
+              _rf_context(rf_context) {}
 };
 
 Status IRuntimeFilter::send_filter_size(RuntimeState* state, uint64_t local_filter_size) {
     DCHECK(is_producer());
 
-    if (_need_local_merge) {
+    if (!_state->global_runtime_filter_mgr()->get_consume_filters(_filter_id).empty()) {
         LocalMergeFilters* local_merge_filters = nullptr;
-        RETURN_IF_ERROR(_state->runtime_filter_mgr->get_local_merge_producer_filters(
+        RETURN_IF_ERROR(_state->global_runtime_filter_mgr()->get_local_merge_producer_filters(
                 _filter_id, &local_merge_filters));
         std::lock_guard l(*local_merge_filters->lock);
         local_merge_filters->merge_size_times--;
         local_merge_filters->local_merged_size += local_filter_size;
+        if (_has_local_target) {
+            set_synced_size(local_filter_size);
+        }
         if (local_merge_filters->merge_size_times) {
             return Status::OK();
         } else {
@@ -1079,24 +1130,25 @@ Status IRuntimeFilter::send_filter_size(RuntimeState* state, uint64_t local_filt
 
     TNetworkAddress addr;
     DCHECK(_state != nullptr);
-    RETURN_IF_ERROR(_state->runtime_filter_mgr->get_merge_addr(&addr));
+    RETURN_IF_ERROR(_state->global_runtime_filter_mgr()->get_merge_addr(&addr));
     std::shared_ptr<PBackendService_Stub> stub(
-            _state->exec_env->brpc_internal_client_cache()->get_client(addr));
+            _state->get_query_ctx()->exec_env()->brpc_internal_client_cache()->get_client(addr));
     if (!stub) {
-        std::string msg =
-                fmt::format("Get rpc stub failed, host={},  port=", addr.hostname, addr.port);
-        return Status::InternalError(msg);
+        return Status::InternalError("Get rpc stub failed, host={}, port={}", addr.hostname,
+                                     addr.port);
     }
 
     auto request = std::make_shared<PSendFilterSizeRequest>();
     auto callback = DummyBrpcCallback<PSendFilterSizeResponse>::create_shared();
     // IRuntimeFilter maybe deconstructed before the rpc finished, so that could not use
     // a raw pointer in closure. Has to use the context's shared ptr.
-    auto closure = SyncSizeClosure::create_unique(request, callback, _dependency,
-                                                  _wrapper->_context, this->debug_string());
+    auto closure = SyncSizeClosure::create_unique(
+            request, callback, _dependency, _wrapper->_context,
+            state->query_options().ignore_runtime_filter_error ? std::weak_ptr<QueryContext> {}
+                                                               : state->get_query_ctx_weak());
     auto* pquery_id = request->mutable_query_id();
-    pquery_id->set_hi(_state->query_id.hi());
-    pquery_id->set_lo(_state->query_id.lo());
+    pquery_id->set_hi(_state->get_query_ctx()->query_id().hi);
+    pquery_id->set_lo(_state->get_query_ctx()->query_id().lo);
 
     auto* source_addr = request->mutable_source_addr();
     source_addr->set_hostname(BackendOptions::get_local_backend().host);
@@ -1104,7 +1156,11 @@ Status IRuntimeFilter::send_filter_size(RuntimeState* state, uint64_t local_filt
 
     request->set_filter_size(local_filter_size);
     request->set_filter_id(_filter_id);
-    callback->cntl_->set_timeout_ms(std::min(3600, state->execution_timeout()) * 1000);
+
+    callback->cntl_->set_timeout_ms(get_execution_rpc_timeout_ms(state->execution_timeout()));
+    if (config::execution_ignore_eovercrowded) {
+        callback->cntl_->ignore_eovercrowded();
+    }
 
     stub->send_filter_size(closure->cntl_.get(), closure->request_.get(), closure->response_.get(),
                            closure.get());
@@ -1112,36 +1168,43 @@ Status IRuntimeFilter::send_filter_size(RuntimeState* state, uint64_t local_filt
     return Status::OK();
 }
 
-Status IRuntimeFilter::push_to_remote(const TNetworkAddress* addr) {
+Status IRuntimeFilter::push_to_remote(RuntimeState* state, const TNetworkAddress* addr) {
     DCHECK(is_producer());
     std::shared_ptr<PBackendService_Stub> stub(
-            _state->exec_env->brpc_internal_client_cache()->get_client(*addr));
+            _state->get_query_ctx()->exec_env()->brpc_internal_client_cache()->get_client(*addr));
     if (!stub) {
         return Status::InternalError(
-                fmt::format("Get rpc stub failed, host={},  port=", addr->hostname, addr->port));
+                fmt::format("Get rpc stub failed, host={}, port={}", addr->hostname, addr->port));
     }
 
     auto merge_filter_request = std::make_shared<PMergeFilterRequest>();
     auto merge_filter_callback = DummyBrpcCallback<PMergeFilterResponse>::create_shared();
     auto merge_filter_closure =
             AutoReleaseClosure<PMergeFilterRequest, DummyBrpcCallback<PMergeFilterResponse>>::
-                    create_unique(merge_filter_request, merge_filter_callback);
+                    create_unique(merge_filter_request, merge_filter_callback,
+                                  state->query_options().ignore_runtime_filter_error
+                                          ? std::weak_ptr<QueryContext> {}
+                                          : state->get_query_ctx_weak());
     void* data = nullptr;
     int len = 0;
 
     auto* pquery_id = merge_filter_request->mutable_query_id();
-    pquery_id->set_hi(_state->query_id.hi());
-    pquery_id->set_lo(_state->query_id.lo());
+    pquery_id->set_hi(_state->get_query_ctx()->query_id().hi);
+    pquery_id->set_lo(_state->get_query_ctx()->query_id().lo);
 
     auto* pfragment_instance_id = merge_filter_request->mutable_fragment_instance_id();
     pfragment_instance_id->set_hi(BackendOptions::get_local_backend().id);
     pfragment_instance_id->set_lo((int64_t)this);
 
     merge_filter_request->set_filter_id(_filter_id);
-    merge_filter_request->set_is_pipeline(true);
     auto column_type = _wrapper->column_type();
-    merge_filter_request->set_column_type(to_proto(column_type));
-    merge_filter_callback->cntl_->set_timeout_ms(wait_time_ms());
+    RETURN_IF_CATCH_EXCEPTION(merge_filter_request->set_column_type(to_proto(column_type)));
+
+    merge_filter_callback->cntl_->set_timeout_ms(
+            get_execution_rpc_timeout_ms(_state->get_query_ctx()->execution_timeout()));
+    if (config::execution_ignore_eovercrowded) {
+        merge_filter_callback->cntl_->ignore_eovercrowded();
+    }
 
     if (get_ignored()) {
         merge_filter_request->set_filter_type(PFilterType::UNKNOW_FILTER);
@@ -1175,7 +1238,7 @@ Status IRuntimeFilter::get_push_expr_ctxs(std::list<vectorized::VExprContextSPtr
     // The runtime filter is pushed down, adding filtering information.
     auto* expr_filtered_rows_counter = ADD_COUNTER(_profile, "expr_filtered_rows", TUnit::UNIT);
     auto* expr_input_rows_counter = ADD_COUNTER(_profile, "expr_input_rows", TUnit::UNIT);
-    auto* always_true_counter = ADD_COUNTER(_profile, "always_true", TUnit::UNIT);
+    auto* always_true_counter = ADD_COUNTER(_profile, "always_true_pass_rows", TUnit::UNIT);
     for (auto i = origin_size; i < push_exprs.size(); i++) {
         push_exprs[i]->attach_profile_counter(expr_filtered_rows_counter, expr_input_rows_counter,
                                               always_true_counter);
@@ -1185,10 +1248,10 @@ Status IRuntimeFilter::get_push_expr_ctxs(std::list<vectorized::VExprContextSPtr
 
 void IRuntimeFilter::update_state() {
     DCHECK(is_consumer());
-    auto execution_timeout = _state->execution_timeout * 1000;
-    auto runtime_filter_wait_time_ms = _state->runtime_filter_wait_time_ms;
+    auto execution_timeout = _state->get_query_ctx()->execution_timeout() * 1000;
+    auto runtime_filter_wait_time_ms = _state->get_query_ctx()->runtime_filter_wait_time_ms();
     // bitmap filter is precise filter and only filter once, so it must be applied.
-    int64_t wait_times_ms = _wrapper->get_real_type() == RuntimeFilterType::BITMAP_FILTER
+    int64_t wait_times_ms = _runtime_filter_type == RuntimeFilterType::BITMAP_FILTER
                                     ? execution_timeout
                                     : runtime_filter_wait_time_ms;
     auto expected = _rf_state_atomic.load(std::memory_order_acquire);
@@ -1235,19 +1298,21 @@ void IRuntimeFilter::signal() {
 }
 
 void IRuntimeFilter::set_filter_timer(std::shared_ptr<pipeline::RuntimeFilterTimer> timer) {
+    std::unique_lock lock(_inner_mutex);
     _filter_timer.push_back(timer);
 }
 
-void IRuntimeFilter::set_dependency(std::shared_ptr<pipeline::Dependency> dependency) {
+void IRuntimeFilter::set_finish_dependency(
+        const std::shared_ptr<pipeline::CountedFinishDependency>& dependency) {
     _dependency = dependency;
-    ((pipeline::CountedFinishDependency*)_dependency.get())->add();
+    _dependency->add();
     CHECK(_dependency);
 }
 
 void IRuntimeFilter::set_synced_size(uint64_t global_size) {
     _synced_size = global_size;
     if (_dependency) {
-        ((pipeline::CountedFinishDependency*)_dependency.get())->sub();
+        _dependency->sub();
     }
 }
 
@@ -1261,14 +1326,10 @@ bool IRuntimeFilter::get_ignored() {
 
 std::string IRuntimeFilter::formatted_state() const {
     return fmt::format(
-            "[IsPushDown = {}, RuntimeFilterState = {}, HasRemoteTarget = {}, "
+            "[Id = {}, IsPushDown = {}, RuntimeFilterState = {}, HasRemoteTarget = {}, "
             "HasLocalTarget = {}, Ignored = {}]",
-            _is_push_down, _get_explain_state_string(), _has_remote_target, _has_local_target,
-            _wrapper->_context->ignored);
-}
-
-BloomFilterFuncBase* IRuntimeFilter::get_bloomfilter() const {
-    return _wrapper->get_bloomfilter();
+            _filter_id, _is_push_down, _get_explain_state_string(), _has_remote_target,
+            _has_local_target, _wrapper->_context->ignored);
 }
 
 Status IRuntimeFilter::init_with_desc(const TRuntimeFilterDesc* desc, const TQueryOptions* options,
@@ -1294,18 +1355,19 @@ Status IRuntimeFilter::init_with_desc(const TRuntimeFilterDesc* desc, const TQue
     params.runtime_bloom_filter_max_size = options->__isset.runtime_bloom_filter_max_size
                                                    ? options->runtime_bloom_filter_max_size
                                                    : 0;
-    // We build runtime filter by exact distinct count iff three conditions are met:
+    auto sync_filter_size = desc->__isset.sync_filter_size && desc->sync_filter_size;
+    // We build runtime filter by exact distinct count if all of 3 conditions are met:
     // 1. Only 1 join key
-    // 2. Do not have remote target (e.g. do not need to merge), or broadcast join
-    // 3. Bloom filter
+    // 2. Bloom filter
+    // 3. Size of all bloom filters will be same (size will be sync or this is a broadcast join).
     params.build_bf_exactly =
             build_bf_exactly && (_runtime_filter_type == RuntimeFilterType::BLOOM_FILTER ||
                                  _runtime_filter_type == RuntimeFilterType::IN_OR_BLOOM_FILTER);
 
     params.bloom_filter_size_calculated_by_ndv = desc->bloom_filter_size_calculated_by_ndv;
 
-    if (!desc->__isset.sync_filter_size || !desc->sync_filter_size) {
-        params.build_bf_exactly &= (!_has_remote_target || _is_broadcast_join);
+    if (!sync_filter_size) {
+        params.build_bf_exactly &= !_is_broadcast_join;
     }
 
     if (desc->__isset.bloom_filter_size_bytes) {
@@ -1413,13 +1475,10 @@ template <class T>
 Status IRuntimeFilter::_create_wrapper(const T* param,
                                        std::unique_ptr<RuntimePredicateWrapper>* wrapper) {
     int filter_type = param->request->filter_type();
-    PrimitiveType column_type = PrimitiveType::INVALID_TYPE;
-    if (param->request->has_in_filter()) {
-        column_type = to_primitive_type(param->request->in_filter().column_type());
+    if (!param->request->has_column_type()) {
+        return Status::InternalError("unknown filter column type");
     }
-    if (param->request->has_column_type()) {
-        column_type = to_primitive_type(param->request->column_type());
-    }
+    PrimitiveType column_type = to_primitive_type(param->request->column_type());
     *wrapper = std::make_unique<RuntimePredicateWrapper>(column_type, get_type(filter_type),
                                                          param->request->filter_id());
 
@@ -1465,10 +1524,10 @@ void IRuntimeFilter::update_runtime_filter_type_to_profile() {
 
 std::string IRuntimeFilter::debug_string() const {
     return fmt::format(
-            "RuntimeFilter: (id = {}, type = {}, need_local_merge: {}, is_broadcast: {}, "
-            "build_bf_cardinality: {}",
-            _filter_id, to_string(_runtime_filter_type), _need_local_merge, _is_broadcast_join,
-            _wrapper->get_build_bf_cardinality());
+            "RuntimeFilter: (id = {}, type = {}, is_broadcast: {}, "
+            "build_bf_cardinality: {}, error_msg: {}",
+            _filter_id, to_string(_runtime_filter_type), _is_broadcast_join,
+            _wrapper->get_build_bf_cardinality(), _wrapper->_context->err_msg);
 }
 
 Status IRuntimeFilter::merge_from(const RuntimePredicateWrapper* wrapper) {
@@ -1639,9 +1698,21 @@ void IRuntimeFilter::to_protobuf(PInFilter* filter) {
         });
         return;
     }
+    case TYPE_IPV4: {
+        batch_copy<IPv4>(filter, it, [](PColumnValue* column, const IPv4* value) {
+            column->set_intval(*reinterpret_cast<const int32_t*>(value));
+        });
+        return;
+    }
+    case TYPE_IPV6: {
+        batch_copy<IPv6>(filter, it, [](PColumnValue* column, const IPv6* value) {
+            column->set_stringval(LargeIntValue::to_string(*value));
+        });
+        return;
+    }
     default: {
-        DCHECK(false) << "unknown type";
-        break;
+        throw Exception(ErrorCode::INTERNAL_ERROR,
+                        "runtime filter meet invalid PrimitiveType type {}", int(column_type));
     }
     }
 }
@@ -1755,9 +1826,22 @@ void IRuntimeFilter::to_protobuf(PMinMaxFilter* filter) {
         filter->mutable_max_val()->set_stringval(*max_string_value);
         break;
     }
+    case TYPE_IPV4: {
+        filter->mutable_min_val()->set_intval(*reinterpret_cast<const int32_t*>(min_data));
+        filter->mutable_max_val()->set_intval(*reinterpret_cast<const int32_t*>(max_data));
+        return;
+    }
+    case TYPE_IPV6: {
+        filter->mutable_min_val()->set_stringval(
+                LargeIntValue::to_string(*reinterpret_cast<const uint128_t*>(min_data)));
+        filter->mutable_max_val()->set_stringval(
+                LargeIntValue::to_string(*reinterpret_cast<const uint128_t*>(max_data)));
+        return;
+    }
     default: {
-        DCHECK(false) << "unknown type";
-        break;
+        throw Exception(ErrorCode::INTERNAL_ERROR,
+                        "runtime filter meet invalid PrimitiveType type {}",
+                        int(_wrapper->column_type()));
     }
     }
 }
@@ -1833,7 +1917,9 @@ Status RuntimePredicateWrapper::get_push_exprs(
         node.__set_is_nullable(false);
         auto in_pred = vectorized::VDirectInPredicate::create_shared(node, _context->hybrid_set);
         in_pred->add_child(probe_ctx->root());
-        auto wrapper = vectorized::VRuntimeFilterWrapper::create_shared(node, in_pred, null_aware);
+        auto wrapper = vectorized::VRuntimeFilterWrapper::create_shared(
+                node, in_pred, get_in_list_ignore_thredhold(_context->hybrid_set->size()),
+                null_aware);
         container.push_back(wrapper);
         break;
     }
@@ -1848,8 +1934,8 @@ Status RuntimePredicateWrapper::get_push_exprs(
                                        min_literal));
         min_pred->add_child(probe_ctx->root());
         min_pred->add_child(min_literal);
-        container.push_back(
-                vectorized::VRuntimeFilterWrapper::create_shared(min_pred_node, min_pred));
+        container.push_back(vectorized::VRuntimeFilterWrapper::create_shared(
+                min_pred_node, min_pred, get_comparison_ignore_thredhold()));
         break;
     }
     case RuntimeFilterType::MAX_FILTER: {
@@ -1863,8 +1949,8 @@ Status RuntimePredicateWrapper::get_push_exprs(
                                        max_literal));
         max_pred->add_child(probe_ctx->root());
         max_pred->add_child(max_literal);
-        container.push_back(
-                vectorized::VRuntimeFilterWrapper::create_shared(max_pred_node, max_pred));
+        container.push_back(vectorized::VRuntimeFilterWrapper::create_shared(
+                max_pred_node, max_pred, get_comparison_ignore_thredhold()));
         break;
     }
     case RuntimeFilterType::MINMAX_FILTER: {
@@ -1878,8 +1964,8 @@ Status RuntimePredicateWrapper::get_push_exprs(
                                        max_literal));
         max_pred->add_child(probe_ctx->root());
         max_pred->add_child(max_literal);
-        container.push_back(vectorized::VRuntimeFilterWrapper::create_shared(max_pred_node,
-                                                                             max_pred, null_aware));
+        container.push_back(vectorized::VRuntimeFilterWrapper::create_shared(
+                max_pred_node, max_pred, get_comparison_ignore_thredhold(), null_aware));
 
         vectorized::VExprContextSPtr new_probe_ctx;
         RETURN_IF_ERROR(vectorized::VExpr::create_expr_tree(probe_expr, new_probe_ctx));
@@ -1895,8 +1981,8 @@ Status RuntimePredicateWrapper::get_push_exprs(
                                        _context->minmax_func->get_min(), min_literal));
         min_pred->add_child(new_probe_ctx->root());
         min_pred->add_child(min_literal);
-        container.push_back(vectorized::VRuntimeFilterWrapper::create_shared(min_pred_node,
-                                                                             min_pred, null_aware));
+        container.push_back(vectorized::VRuntimeFilterWrapper::create_shared(
+                min_pred_node, min_pred, get_comparison_ignore_thredhold(), null_aware));
         break;
     }
     case RuntimeFilterType::BLOOM_FILTER: {
@@ -1911,7 +1997,8 @@ Status RuntimePredicateWrapper::get_push_exprs(
         auto bloom_pred = vectorized::VBloomPredicate::create_shared(node);
         bloom_pred->set_filter(_context->bloom_filter_func);
         bloom_pred->add_child(probe_ctx->root());
-        auto wrapper = vectorized::VRuntimeFilterWrapper::create_shared(node, bloom_pred);
+        auto wrapper = vectorized::VRuntimeFilterWrapper::create_shared(
+                node, bloom_pred, get_bloom_filter_ignore_thredhold());
         container.push_back(wrapper);
         break;
     }
@@ -1927,7 +2014,7 @@ Status RuntimePredicateWrapper::get_push_exprs(
         auto bitmap_pred = vectorized::VBitmapPredicate::create_shared(node);
         bitmap_pred->set_filter(_context->bitmap_filter_func);
         bitmap_pred->add_child(probe_ctx->root());
-        auto wrapper = vectorized::VRuntimeFilterWrapper::create_shared(node, bitmap_pred);
+        auto wrapper = vectorized::VRuntimeFilterWrapper::create_shared(node, bitmap_pred, 0);
         container.push_back(wrapper);
         break;
     }

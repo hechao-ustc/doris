@@ -77,7 +77,7 @@ public class DateTimeV2Literal extends DateTimeLiteral {
             this.second = localDateTime.getSecond();
             this.microSecond -= 1000000;
         }
-        if (checkRange() || checkDate()) {
+        if (checkRange() || checkDate(year, month, day)) {
             // may fallback to legacy planner. make sure the behaviour of rounding is same.
             throw new AnalysisException("datetime literal [" + toString() + "] is out of range");
         }
@@ -102,6 +102,11 @@ public class DateTimeV2Literal extends DateTimeLiteral {
     public LiteralExpr toLegacyLiteral() {
         return new org.apache.doris.analysis.DateLiteral(year, month, day, hour, minute, second, microSecond,
                 getDataType().toCatalogDataType());
+    }
+
+    @Override
+    public double getDouble() {
+        return super.getDouble() + microSecond / 1000000.0;
     }
 
     @Override
@@ -291,6 +296,6 @@ public class DateTimeV2Literal extends DateTimeLiteral {
             return false;
         }
         DateTimeV2Literal literal = (DateTimeV2Literal) o;
-        return Objects.equals(dataType, literal.dataType);
+        return Objects.equals(dataType, literal.dataType) && Objects.equals(microSecond, literal.microSecond);
     }
 }

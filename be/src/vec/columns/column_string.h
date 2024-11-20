@@ -62,9 +62,11 @@ public:
 
     void static check_chars_length(size_t total_length, size_t element_number) {
         if (UNLIKELY(total_length > MAX_STRING_SIZE)) {
-            throw Exception(ErrorCode::STRING_OVERFLOW_IN_VEC_ENGINE,
-                            "string column length is too large: total_length={}, element_number={}",
-                            total_length, element_number);
+            throw Exception(
+                    ErrorCode::STRING_OVERFLOW_IN_VEC_ENGINE,
+                    "string column length is too large: total_length={}, element_number={}, "
+                    "you can set batch_size a number smaller than {} to avoid this error",
+                    total_length, element_number, element_number);
         }
     }
 
@@ -83,6 +85,7 @@ private:
     /// For convenience, every string ends with terminating zero byte. Note that strings could contain zero bytes in the middle.
     Chars chars;
 
+    // Start position of i-th element.
     size_t ALWAYS_INLINE offset_at(ssize_t i) const { return offsets[i - 1]; }
 
     /// Size of i-th element, including terminating zero.
@@ -103,7 +106,7 @@ public:
     bool is_variable_length() const override { return true; }
     // used in string ut testd
     void sanity_check() const;
-    const char* get_family_name() const override { return "String"; }
+    std::string get_name() const override { return "String"; }
 
     size_t size() const override { return offsets.size(); }
 
@@ -115,12 +118,11 @@ public:
 
     MutableColumnPtr clone_resized(size_t to_size) const override;
 
-    MutableColumnPtr get_shrinked_column() override;
-    bool could_shrinked_column() override { return true; }
+    void shrink_padding_chars() override;
 
     Field operator[](size_t n) const override {
         assert(n < size());
-        return Field(&chars[offset_at(n)], size_at(n));
+        return Field(String(reinterpret_cast<const char*>(&chars[offset_at(n)]), size_at(n)));
     }
 
     void get(size_t n, Field& res) const override {
@@ -130,7 +132,7 @@ public:
             res = JsonbField(reinterpret_cast<const char*>(&chars[offset_at(n)]), size_at(n));
             return;
         }
-        res.assign_string(&chars[offset_at(n)], size_at(n));
+        res = Field(String(reinterpret_cast<const char*>(&chars[offset_at(n)]), size_at(n)));
     }
 
     StringRef get_data_at(size_t n) const override {
@@ -158,6 +160,8 @@ public:
         memcpy(chars.data() + old_size, s.data, size_to_append);
         offsets.push_back(new_size);
     }
+
+    void insert_many_from(const IColumn& src, size_t position, size_t length) override;
 
     bool is_column_string64() const override { return sizeof(T) == sizeof(uint64_t); }
 
@@ -506,16 +510,6 @@ public:
                          IColumn::Permutation& res) const override;
 
     ColumnPtr replicate(const IColumn::Offsets& replicate_offsets) const override;
-
-    void append_data_by_selector(MutableColumnPtr& res,
-                                 const IColumn::Selector& selector) const override {
-        this->template append_data_by_selector_impl<ColumnStr<T>>(res, selector);
-    }
-
-    void append_data_by_selector(MutableColumnPtr& res, const IColumn::Selector& selector,
-                                 size_t begin, size_t end) const override {
-        this->template append_data_by_selector_impl<ColumnStr<T>>(res, selector, begin, end);
-    }
 
     void reserve(size_t n) override;
 

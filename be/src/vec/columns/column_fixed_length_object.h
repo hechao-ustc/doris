@@ -49,7 +49,7 @@ private:
               _data(src._data.begin(), src._data.end()) {}
 
 public:
-    const char* get_family_name() const override { return "ColumnFixedLengthObject"; }
+    std::string get_name() const override { return "ColumnFixedLengthObject"; }
 
     size_t size() const override { return _item_count; }
 
@@ -105,11 +105,13 @@ public:
     }
 
     Field operator[](size_t n) const override {
-        return {_data.data() + n * _item_size, _item_size};
+        return Field(
+                String(reinterpret_cast<const char*>(_data.data() + n * _item_size), _item_size));
     }
 
     void get(size_t n, Field& res) const override {
-        res.assign_string(_data.data() + n * _item_size, _item_size);
+        res = Field(
+                String(reinterpret_cast<const char*>(_data.data() + n * _item_size), _item_size));
     }
 
     StringRef get_data_at(size_t n) const override {
@@ -246,16 +248,6 @@ public:
         }
 
         return res;
-    }
-
-    void append_data_by_selector(MutableColumnPtr& res,
-                                 const IColumn::Selector& selector) const override {
-        this->template append_data_by_selector_impl<Self>(res, selector);
-    }
-
-    void append_data_by_selector(MutableColumnPtr& res, const IColumn::Selector& selector,
-                                 size_t begin, size_t end) const override {
-        this->template append_data_by_selector_impl<Self>(res, selector, begin, end);
     }
 
     size_t byte_size() const override { return _data.size(); }
